@@ -34,9 +34,11 @@ import geopandas as gpd
 import bhae_delineamento as bd
 import bhae_online as bo
 
-# Bacia pronta (BHAE simplificada). No repo (GitHub) por padrão; pode ser URL R2.
-BHAE_BACIAS = "dados/bhae_bacias.parquet"
-BHAE_INDICE = "dados/bhae_indice.parquet"
+# Bacia pronta (BHAE simplificada). Caminho ancorado no arquivo do app (não no
+# diretório de execução), igual ao inventário — funciona local e no Streamlit
+# Cloud. Pode ser trocado por uma URL (R2) no futuro.
+BHAE_BACIAS = str(Path(__file__).with_name("dados") / "bhae_bacias.parquet")
+BHAE_INDICE = str(Path(__file__).with_name("dados") / "bhae_indice.parquet")
 
 
 @st.cache_data(show_spinner=False)
