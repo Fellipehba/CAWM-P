@@ -32,6 +32,22 @@ import streamlit as st
 import geopandas as gpd
 
 import bhae_delineamento as bd
+import bhae_online as bo
+
+# Bacia pronta (BHAE simplificada). No repo (GitHub) por padrão; pode ser URL R2.
+BHAE_BACIAS = "dados/bhae_bacias.parquet"
+BHAE_INDICE = "dados/bhae_indice.parquet"
+
+
+@st.cache_data(show_spinner=False)
+def _bhae_indice():
+    return bo.carregar_indice(BHAE_INDICE)
+
+
+@st.cache_resource(show_spinner=False)
+def _bhae_bacias_disponivel():
+    from pathlib import Path
+    return Path(BHAE_BACIAS).exists() or str(BHAE_BACIAS).startswith("http")
 import selecao_postos as sp
 import chuva_media_idw as idw
 import aquisicao_ana as ana
@@ -289,41 +305,12 @@ with st.sidebar:
     else:
         st.caption("Inventário default indisponível.")
 
-    with st.expander("Buscar estação fluviométrica para exutório", expanded=True):
-        termo_flu = st.text_input("Código ou nome da estação FLU", key="busca_flu")
-        res_flu = invmod.buscar_estacao(INV_FLU, termo_flu).head(25) if termo_flu else pd.DataFrame()
-        if len(res_flu):
-            labels = [f"{r.cod} · {r.nome} · ({r.lat:.4f}, {r.lon:.4f})"
-                      for r in res_flu.itertuples()]
-            escolha = st.selectbox("Resultado", labels, key="sel_flu_label")
-            idx = labels.index(escolha)
-            if st.button("Usar estação como exutório", use_container_width=True):
-                _aplicar_estacao_exutorio(res_flu.iloc[idx])
-                st.rerun()
-        elif termo_flu:
-            st.info("Nenhuma estação FLU encontrada para o termo informado.")
-
-    st.header("1 · Base hidrográfica (BHAE)")
-    tr_file = st.file_uploader("Trechos de drenagem (.gpkg/.shp/.zip)",
-                               type=["gpkg", "shp", "zip"])
-    ar_file = st.file_uploader("Áreas de drenagem (.gpkg/.shp/.zip)",
-                               type=["gpkg", "shp", "zip"])
-
     st.divider()
-    st.header("Exutório")
-    lon_val = st.number_input("Longitude", value=float(ss.lon), format="%.6f", key="lon_widget")
-    lat_val = st.number_input("Latitude", value=float(ss.lat), format="%.6f", key="lat_widget")
-    if float(lon_val) != float(ss.lon) or float(lat_val) != float(ss.lat):
-        ss.lon = float(lon_val)
-        ss.lat = float(lat_val)
-        ss.exutorio_estacao = None
-        ss.bacia = None
-        ss.postos_sel = None
-        ss.etp_mensal = None
+    st.header("Exutório selecionado")
     if ss.exutorio_estacao:
-        st.caption(f"Exutório por estação FLU: {ss.exutorio_estacao['cod']} · "
-                   f"{ss.exutorio_estacao['nome']}")
-    snap = st.slider("Raio de snap ao rio (m)", 100, 2000, 500, 100)
+        st.caption(f"{ss.exutorio_estacao['cod']} · {ss.exutorio_estacao['nome']}")
+    else:
+        st.caption("Selecione a bacia no Passo 1 (busca por posto FLU).")
     buffer_km = st.slider("Buffer de postos PLU (km)", 0, 50, 10, 5)
 
     st.divider()
@@ -361,59 +348,83 @@ estacoes_mapa = invmod.subset_bbox(INV, lat=float(ss.lat), lon=float(ss.lon),
 
 
 # ==========================================================================
-# Passo 1 — Delineamento
+# Passo 1 — Bacia da estação (BHAE pronta)  [método principal]
 # ==========================================================================
-st.subheader("Passo 1 · Delineamento da bacia")
+st.subheader("Passo 1 · Bacia da estação (BHAE pronta)")
+try:
+    idx_bhae = _bhae_indice()
+except Exception as e:
+    idx_bhae = None
+    st.warning(f"Índice BHAE não disponível ({e}). Use o delineamento por upload "
+               "mais abaixo.")
+
+if idx_bhae is not None:
+    st.caption(f"{len(idx_bhae):,} postos FLU com bacia pronta. "
+               "Busque por código ou nome — sem delinear em tempo real.")
+    termo_b = st.text_input("Buscar posto FLU (código ou nome)", key="busca_bhae")
+    res_b = bo.buscar(idx_bhae, termo_b).head(30) if termo_b else idx_bhae.head(0)
+    if len(res_b):
+        labels_b = [f"{r.cod_posto} · {r.nome_posto} · "
+                    f"{r.area_usada_km2:,.0f} km² · {r.rio_bhae}".replace(",", ".")
+                    for r in res_b.itertuples()]
+        escolha_b = st.selectbox("Resultado", labels_b, key="sel_bhae")
+        r0 = res_b.iloc[labels_b.index(escolha_b)]
+        cod_sel = str(r0["cod_posto"])
+        if st.button("Carregar bacia pronta", type="primary",
+                     use_container_width=True):
+            with st.spinner("Carregando bacia…"):
+                try:
+                    bacia = bo.bacia_pronta(BHAE_BACIAS, cod_sel)
+                except Exception as e:
+                    bacia = None
+                    st.error(f"Falha ao ler a geometria: {e}")
+                if bacia is None:
+                    st.error(f"Bacia não encontrada para {cod_sel}.")
+                else:
+                    ss.bacia = bacia
+                    ss.exutorio_estacao = {"cod": cod_sel,
+                                           "nome": str(r0["nome_posto"]),
+                                           "lon": float(r0["lon_posto"]),
+                                           "lat": float(r0["lat_posto"])}
+                    ss.lon = float(r0["lon_posto"])
+                    ss.lat = float(r0["lat_posto"])
+                    ss.postos_sel = None
+                    ss.chuva_media = None
+                    _calcular_etp_bacia()
+                    st.success(f"Bacia {cod_sel} carregada: "
+                               f"{bacia.area_km2:,.0f} km².".replace(",", "."))
+    elif termo_b:
+        st.info("Nenhum posto FLU com bacia pronta para esse termo.")
+
+st.divider()
+
+# ==========================================================================
+# Passo 1 — Resumo da bacia + mapa
+# ==========================================================================
 col1, col2 = st.columns([1, 2])
 with col1:
-    if st.button("Delinear bacia", type="primary", use_container_width=True):
-        tr = _load_geo(tr_file) if tr_file else ss.trechos
-        ar = _load_geo(ar_file) if ar_file else ss.areas
-        if tr is None or ar is None:
-            st.error("Envie as duas camadas da BHAE (trechos e áreas).")
-        else:
-            ss.trechos, ss.areas = tr, ar
-            with st.spinner("Navegando a topologia a montante…"):
-                ss.bacia = bd.delineate(tr, ar, float(ss.lon), float(ss.lat), snap_m=snap)
-                ss.postos_sel = None
-                ss.chuva_media = None
-                _calcular_etp_bacia()
-
     if ss.bacia is not None:
         b = ss.bacia
-        st.metric("Área a montante (oficial ANA)", f"{b.area_km2:,.0f} km²")
-        st.caption(f"Rio: {b.rio} · {b.n_trechos} trechos · snap {b.snap_dist_m:.0f} m")
-        if abs(b.area_km2 - b.area_poly_km2) < 0.5:
-            st.success("Área consistente (atributo = polígono).")
-        elif np.isfinite(b.area_poly_km2):
-            st.warning(f"Diferença atributo × polígono: {b.area_km2 - b.area_poly_km2:,.1f} km²")
-
-        st.download_button("Baixar limite consolidado da bacia (GeoJSON)",
+        st.metric("Área a montante (oficial ANA)",
+                  f"{b.area_km2:,.0f} km²".replace(",", "."))
+        st.caption(f"Rio: {b.rio}")
+        st.download_button("Baixar limite da bacia (GeoJSON)",
                            _geojson_bytes(b.polygon),
                            file_name="bacia_consolidada.geojson",
                            mime="application/geo+json",
                            use_container_width=True)
         st.download_button("Baixar metadados da bacia (JSON)",
-                           json.dumps(_metadata_dict(), ensure_ascii=False, indent=2).encode("utf-8"),
+                           json.dumps(_metadata_dict(), ensure_ascii=False,
+                                      indent=2).encode("utf-8"),
                            file_name="metadados_bacia.json",
                            mime="application/json",
                            use_container_width=True)
-        with st.expander("Download secundário: drenagem a montante", expanded=False):
-            dren = _drenagem_montante()
-            if dren is not None and len(dren):
-                st.caption(f"{len(dren):,} trecho(s) de drenagem a montante.")
-                st.download_button("Baixar drenagem a montante (GeoJSON)",
-                                   _geojson_bytes(dren),
-                                   file_name="drenagem_montante.geojson",
-                                   mime="application/geo+json",
-                                   use_container_width=True)
-            else:
-                st.info("Drenagem indisponível. Delineie a bacia com a camada de trechos carregada.")
-
+    else:
+        st.info("Carregue uma bacia acima (busca por posto FLU).")
 with col2:
     _render_map(ss.bacia, ss.postos_sel, float(ss.lon), float(ss.lat), estacoes_mapa)
-    st.caption(f"Mapa com filtro espacial: {len(estacoes_mapa):,} estação(ões) exibidas. "
-               "Clique em uma FLU para preencher o exutório.")
+    st.caption(f"Mapa: {len(estacoes_mapa):,} estação(ões) na vizinhança."
+               .replace(",", "."))
 
 
 # ==========================================================================
@@ -549,24 +560,6 @@ if st.button("⬇ Baixar vazão do exutório (ANA)", disabled=not cod_flu):
             st.error(f"Falha ao baixar vazão: {e}")
 if ss.get("vazao") is not None:
     st.caption(f"Vazão do exutório carregada ({int(ss.vazao.notna().sum())} dias).")
-
-# --- Opção B: upload manual (fallback que nunca quebra) --------------------
-st.caption("Ou faça upload manual dos arquivos de chuva do HidroWeb:")
-serie_files = st.file_uploader("Arquivos de série de chuva dos postos PLU",
-                               type=["csv", "txt"], accept_multiple_files=True)
-if serie_files and ss.postos_sel is not None:
-    for f in serie_files:
-        cod_match = next((c for c in ss.postos_sel.postos["cod"] if str(c) in f.name), None)
-        if cod_match:
-            try:
-                s = ana.parse_serie_hidroweb(io.StringIO(
-                    f.getvalue().decode("latin-1")), tipo=ana.TIPO_CHUVA)
-                ss.series[cod_match] = s
-            except Exception as e:
-                st.error(f"{f.name}: {e}")
-    st.success(f"{len(ss.series)} série(s) carregada(s).")
-elif serie_files and ss.postos_sel is None:
-    st.info("Selecione os postos PLU antes de carregar as séries.")
 
 
 # ==========================================================================
