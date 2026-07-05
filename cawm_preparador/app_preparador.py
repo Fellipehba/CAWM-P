@@ -395,15 +395,6 @@ if idx_bhae is not None:
                     _calcular_etp_bacia()
                     st.success(f"Bacia {cod_sel} carregada: "
                                f"{bacia.area_km2:,.0f} km².".replace(",", "."))
-                    if not bacia.geometria_confiavel:
-                        st.warning(
-                            "Geometria BHAE incompleta para esta bacia "
-                            f"(polígono {bacia.area_geom_km2:,.0f} km² vs área "
-                            f"oficial {bacia.area_km2:,.0f} km²). ".replace(",", ".")
-                            + "Provável bacia transfronteiriça (drena fora do "
-                            "Brasil, que a BHAE não cobre). O contorno e a "
-                            "seleção de postos PLU não são confiáveis aqui — "
-                            "escolha uma bacia contida no Brasil.")
     elif termo_b:
         st.info("Nenhum posto FLU com bacia pronta para esse termo.")
 
@@ -419,6 +410,15 @@ with col1:
         st.metric("Área a montante (oficial ANA)",
                   f"{b.area_km2:,.0f} km²".replace(",", "."))
         st.caption(f"Rio: {b.rio}")
+        if not getattr(b, "geometria_confiavel", True):
+            st.warning(
+                "⚠️ Geometria BHAE incompleta (polígono "
+                f"{b.area_geom_km2:,.0f} km² vs oficial {b.area_km2:,.0f} km²)."
+                .replace(",", ".")
+                + " Provável bacia transfronteiriça — parte da área drena fora "
+                "do Brasil. Você pode prosseguir, mas o contorno e a seleção de "
+                "postos PLU cobrem só a porção brasileira; a chuva média não "
+                "representa a bacia inteira. Trate o resultado com cautela.")
         st.download_button("Baixar limite da bacia (GeoJSON)",
                            _geojson_bytes(b.polygon),
                            file_name="bacia_consolidada.geojson",
