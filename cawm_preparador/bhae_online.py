@@ -76,6 +76,17 @@ class BaciaPronta:
         self.cod_posto = str(cod_posto)
         self.trechos_montante = frozenset()
         self.trechos = None
+        # Confiabilidade da geometria: área real do polígono vs área oficial.
+        # Bacias transfronteiriças (ex.: Amazônia fora do Brasil) têm polígono
+        # BHAE incompleto → mapa não desenha e seleção de PLU falha.
+        try:
+            self.area_geom_km2 = float(polygon.to_crs(6933).area.sum() / 1e6)
+        except Exception:
+            self.area_geom_km2 = float("nan")
+        self.geometria_confiavel = bool(
+            self.area_geom_km2 == self.area_geom_km2      # não é NaN
+            and self.area_km2 > 0
+            and self.area_geom_km2 >= 0.5 * self.area_km2)
 
     @property
     def bounds(self):
