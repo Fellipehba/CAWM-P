@@ -366,10 +366,15 @@ if idx_bhae is not None:
     termo_b = st.text_input("Buscar posto FLU (código ou nome)", key="busca_bhae")
     res_b = bo.buscar(idx_bhae, termo_b).head(30) if termo_b else idx_bhae.head(0)
     if len(res_b):
-        labels_b = [f"{r.cod_posto} · {r.nome_posto} · "
-                    f"{r.area_usada_km2:,.0f} km² · {r.rio_bhae}".replace(",", ".")
+        labels_b = [f"{'⚠️ ' if not r.geometria_confiavel else ''}{r.cod_posto} · "
+                    f"{r.nome_posto} · {r.area_usada_km2:,.0f} km² · {r.rio_bhae}"
+                    .replace(",", ".")
                     for r in res_b.itertuples()]
-        escolha_b = st.selectbox("Resultado", labels_b, key="sel_bhae")
+        escolha_b = st.selectbox("Resultado", labels_b, key="sel_bhae",
+                                 help="⚠️ = geometria BHAE incompleta para este posto "
+                                      "(travessia de montante não terminou). Pode "
+                                      "carregar, mas o contorno pode não representar "
+                                      "a bacia real.")
         r0 = res_b.iloc[labels_b.index(escolha_b)]
         cod_sel = str(r0["cod_posto"])
         if st.button("Carregar bacia pronta", type="primary",
@@ -415,10 +420,12 @@ with col1:
                 "⚠️ Geometria BHAE incompleta (polígono "
                 f"{b.area_geom_km2:,.0f} km² vs oficial {b.area_km2:,.0f} km²)."
                 .replace(",", ".")
-                + " Provável bacia transfronteiriça — parte da área drena fora "
-                "do Brasil. Você pode prosseguir, mas o contorno e a seleção de "
-                "postos PLU cobrem só a porção brasileira; a chuva média não "
-                "representa a bacia inteira. Trate o resultado com cautela.")
+                + " A agregação de montante falhou para este posto na base "
+                "BHAE — o polígono é apenas a ottobacia local do exutório "
+                "(ocorre tipicamente em estações de UHE/barramento e de calha "
+                "principal). Você pode prosseguir, mas o contorno e a seleção "
+                "de postos PLU NÃO representam a bacia real. Este posto está "
+                "na lista de regeneração da geometria.")
         st.download_button("Baixar limite da bacia (GeoJSON)",
                            _geojson_bytes(b.polygon),
                            file_name="bacia_consolidada.geojson",

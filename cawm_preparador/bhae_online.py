@@ -22,12 +22,29 @@ import pandas as pd
 import geopandas as gpd
 
 
+def _garantir_confiabilidade(g):
+    """Garante as colunas area_geom_km2 / geometria_confiavel. Se o parquet já
+    veio com elas (gerado pelo simplificar_bhae.py atual), usa direto — é
+    quase instantâneo. Só recalcula (mais lento) se faltarem, para não quebrar
+    com parquets antigos."""
+    if "geometria_confiavel" in g.columns and "area_geom_km2" in g.columns:
+        return g
+    if g.geometry.name not in g.columns:
+        return g   # índice sem geometria: nada a calcular aqui
+    area_geom = g.to_crs(6933).area / 1e6
+    area_of = g["area_usada_km2"].astype(float)
+    ratio = (area_geom / area_of).where(area_of > 0)
+    g["area_geom_km2"] = area_geom.round(1)
+    g["geometria_confiavel"] = (ratio >= 0.5).fillna(False)
+    return g
+
+
 @lru_cache(maxsize=4)
 def carregar_bacias(fonte_geo: str) -> gpd.GeoDataFrame:
     """Lê o GeoParquet simplificado (local ou URL). Cacheado em memória."""
     g = gpd.read_parquet(fonte_geo)
     g["cod_posto"] = g["cod_posto"].astype(str).str.strip()
-    return g
+    return _garantir_confiabilidade(g)
 
 
 @lru_cache(maxsize=4)
@@ -39,14 +56,18 @@ def carregar_indice(fonte_idx: str) -> pd.DataFrame:
 
 
 def buscar(idx: pd.DataFrame, termo: str) -> pd.DataFrame:
-    """Busca por código (prefixo) ou nome (contém, sem acento/caixa)."""
-    t = str(termo).strip().lower()
+    """Busca por código (prefixo) ou nome (contém, sem acento/caixa em AMBOS
+    os lados — antes só o nome era normalizado, então buscar 'Ibiaí' com
+    acento não achava 'IBIAÍ')."""
+    def _sem_acento(s):
+        return (s.str.normalize("NFKD")
+                .str.encode("ascii", "ignore").str.decode("ascii").str.lower())
+    t = _sem_acento(pd.Series([str(termo).strip()])).iloc[0]
     if not t:
         return idx.head(0)
     por_cod = idx["cod_posto"].str.startswith(t)
-    nome = idx["nome_posto"].astype(str).str.normalize("NFKD") \
-        .str.encode("ascii", "ignore").str.decode("ascii").str.lower()
-    por_nome = nome.str.contains(t, na=False)
+    nome = _sem_acento(idx["nome_posto"].astype(str))
+    por_nome = nome.str.contains(t, na=False, regex=False)
     return idx[por_cod | por_nome]
 
 
@@ -64,7 +85,9 @@ class BaciaPronta:
     `polygon`, `bounds`) e `trechos_montante` vazio (a bacia pronta não traz a
     rede de drenagem — o download secundário de drenagem fica indisponível)."""
     def __init__(self, polygon: gpd.GeoDataFrame, area_km2: float,
-                 rio: str = "", cod_posto: str = ""):
+                 rio: str = "", cod_posto: str = "",
+                 area_geom_km2: Optional[float] = None,
+                 geometria_confiavel: Optional[bool] = None):
         self.polygon = polygon
         self.area_km2 = float(area_km2)
         self.area_poly_km2 = float(area_km2)      # mesma (geometria simplificada)
@@ -76,17 +99,21 @@ class BaciaPronta:
         self.cod_posto = str(cod_posto)
         self.trechos_montante = frozenset()
         self.trechos = None
-        # Confiabilidade da geometria: área real do polígono vs área oficial.
-        # Bacias transfronteiriças (ex.: Amazônia fora do Brasil) têm polígono
-        # BHAE incompleto → mapa não desenha e seleção de PLU falha.
-        try:
-            self.area_geom_km2 = float(polygon.to_crs(6933).area.sum() / 1e6)
-        except Exception:
-            self.area_geom_km2 = float("nan")
-        self.geometria_confiavel = bool(
-            self.area_geom_km2 == self.area_geom_km2      # não é NaN
-            and self.area_km2 > 0
-            and self.area_geom_km2 >= 0.5 * self.area_km2)
+        # Confiabilidade da geometria: PREFERE o valor pré-calculado (embutido
+        # no parquet por simplificar_bhae.py — instantâneo e consistente com o
+        # índice). Só recalcula se não vier pronto (parquet antigo).
+        if area_geom_km2 is not None and geometria_confiavel is not None:
+            self.area_geom_km2 = float(area_geom_km2)
+            self.geometria_confiavel = bool(geometria_confiavel)
+        else:
+            try:
+                self.area_geom_km2 = float(polygon.to_crs(6933).area.sum() / 1e6)
+            except Exception:
+                self.area_geom_km2 = float("nan")
+            self.geometria_confiavel = bool(
+                self.area_geom_km2 == self.area_geom_km2
+                and self.area_km2 > 0
+                and self.area_geom_km2 >= 0.5 * self.area_km2)
 
     @property
     def bounds(self):
@@ -109,8 +136,12 @@ def bacia_pronta(fonte_geo: str, cod_posto: str) -> Optional["BaciaPronta"]:
     r = sel.iloc[0]
     area = float(r.get("area_usada_km2", float("nan")))
     rio = str(r.get("rio_bhae", "") or "")
+    ageo = r.get("area_geom_km2")
+    conf = r.get("geometria_confiavel")
     return BaciaPronta(sel[[sel.geometry.name]].to_crs(4674), area,
-                       rio=rio, cod_posto=cod_posto)
+                       rio=rio, cod_posto=cod_posto,
+                       area_geom_km2=(None if pd.isna(ageo) else float(ageo)),
+                       geometria_confiavel=(None if pd.isna(conf) else bool(conf)))
 
 
 def selecionar_plu(bacia: gpd.GeoDataFrame, inventario_plu: pd.DataFrame,
