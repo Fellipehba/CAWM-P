@@ -29,6 +29,13 @@ def _garantir_confiabilidade(g):
     com parquets antigos."""
     if "geometria_confiavel" in g.columns and "area_geom_km2" in g.columns:
         return g
+    # novo schema: deriva do status auditado quando disponível
+    if "status" in g.columns:
+        if g.geometry.name in g.columns:
+            g["area_geom_km2"] = (g.to_crs(6933).area / 1e6).round(1)
+        g["geometria_confiavel"] = (g["status"].astype(str).str.lower().str.strip()
+                                    == "ok")
+        return g
     if g.geometry.name not in g.columns:
         return g   # índice sem geometria: nada a calcular aqui
     area_geom = g.to_crs(6933).area / 1e6
@@ -87,7 +94,8 @@ class BaciaPronta:
     def __init__(self, polygon: gpd.GeoDataFrame, area_km2: float,
                  rio: str = "", cod_posto: str = "",
                  area_geom_km2: Optional[float] = None,
-                 geometria_confiavel: Optional[bool] = None):
+                 geometria_confiavel: Optional[bool] = None,
+                 status: Optional[str] = None):
         self.polygon = polygon
         self.area_km2 = float(area_km2)
         self.area_poly_km2 = float(area_km2)      # mesma (geometria simplificada)
@@ -99,6 +107,8 @@ class BaciaPronta:
         self.cod_posto = str(cod_posto)
         self.trechos_montante = frozenset()
         self.trechos = None
+        # status auditado na origem (novo schema); None em parquets antigos
+        self.status = (str(status).lower().strip() if status is not None else None)
         # Confiabilidade da geometria: PREFERE o valor pré-calculado (embutido
         # no parquet por simplificar_bhae.py — instantâneo e consistente com o
         # índice). Só recalcula se não vier pronto (parquet antigo).
@@ -114,6 +124,30 @@ class BaciaPronta:
                 self.area_geom_km2 == self.area_geom_km2
                 and self.area_km2 > 0
                 and self.area_geom_km2 >= 0.5 * self.area_km2)
+
+    # mensagens legíveis por status auditado (novo schema)
+    _MSG_STATUS = {
+        "snap_fraco": "Ajuste ao rio (snap) fraco: nenhum trecho no raio casou "
+                      "a área oficial na tolerância; usou-se o mais próximo. "
+                      "Geometria existe, mas o contorno pode estar deslocado.",
+        "fechamento_fora": "Fechamento de área divergente (>2%) entre a soma a "
+                           "montante e o atributo BHAE — contorno suspeito.",
+        "transfronteirica": "Bacia transfronteiriça: parte drena fora do Brasil. "
+                            "BHAE/BR-DWGD não cobrem a área externa.",
+        "sem_trecho_proximo": "Nenhum trecho de drenagem no raio de busca — "
+                             "sem contorno confiável.",
+        "exutorio_sem_area": "Trecho do exutório sem área acumulada válida na BHAE.",
+    }
+
+    def mensagem_status(self) -> Optional[str]:
+        """Aviso legível para a interface, ou None quando a geometria é confiável."""
+        if self.status and self.status in self._MSG_STATUS:
+            return self._MSG_STATUS[self.status]
+        if not self.geometria_confiavel:
+            return ("Geometria incompleta (polígono "
+                    f"{self.area_geom_km2:,.0f} km² vs oficial "
+                    f"{self.area_km2:,.0f} km²).".replace(",", "."))
+        return None
 
     @property
     def bounds(self):
@@ -138,10 +172,12 @@ def bacia_pronta(fonte_geo: str, cod_posto: str) -> Optional["BaciaPronta"]:
     rio = str(r.get("rio_bhae", "") or "")
     ageo = r.get("area_geom_km2")
     conf = r.get("geometria_confiavel")
+    stt = r.get("status")
     return BaciaPronta(sel[[sel.geometry.name]].to_crs(4674), area,
                        rio=rio, cod_posto=cod_posto,
                        area_geom_km2=(None if pd.isna(ageo) else float(ageo)),
-                       geometria_confiavel=(None if pd.isna(conf) else bool(conf)))
+                       geometria_confiavel=(None if pd.isna(conf) else bool(conf)),
+                       status=(None if pd.isna(stt) else str(stt)))
 
 
 def selecionar_plu(bacia: gpd.GeoDataFrame, inventario_plu: pd.DataFrame,

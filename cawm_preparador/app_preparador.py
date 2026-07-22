@@ -415,17 +415,11 @@ with col1:
         st.metric("Área a montante (oficial ANA)",
                   f"{b.area_km2:,.0f} km²".replace(",", "."))
         st.caption(f"Rio: {b.rio}")
-        if not getattr(b, "geometria_confiavel", True):
-            st.warning(
-                "⚠️ Geometria BHAE incompleta (polígono "
-                f"{b.area_geom_km2:,.0f} km² vs oficial {b.area_km2:,.0f} km²)."
-                .replace(",", ".")
-                + " A agregação de montante falhou para este posto na base "
-                "BHAE — o polígono é apenas a ottobacia local do exutório "
-                "(ocorre tipicamente em estações de UHE/barramento e de calha "
-                "principal). Você pode prosseguir, mas o contorno e a seleção "
-                "de postos PLU NÃO representam a bacia real. Este posto está "
-                "na lista de regeneração da geometria.")
+        _msg = b.mensagem_status() if hasattr(b, "mensagem_status") else (
+            None if getattr(b, "geometria_confiavel", True) else "Geometria incompleta.")
+        if _msg:
+            st.warning("⚠️ " + _msg + " Você pode prosseguir, mas o contorno e "
+                       "a seleção de postos PLU podem não representar a bacia real.")
         st.download_button("Baixar limite da bacia (GeoJSON)",
                            _geojson_bytes(b.polygon),
                            file_name="bacia_consolidada.geojson",
