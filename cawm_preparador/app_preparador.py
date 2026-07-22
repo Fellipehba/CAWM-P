@@ -128,6 +128,21 @@ def _geojson_bytes(gdf: gpd.GeoDataFrame) -> bytes:
     return out.to_json(drop_id=True).encode("utf-8")
 
 
+def _cod_saida() -> str:
+    """Código do posto exutório para prefixar arquivos de saída (só dígitos/
+    letras seguras). Vazio → 'bacia' como fallback."""
+    cod = ""
+    if ss.get("exutorio_estacao"):
+        cod = str(ss.exutorio_estacao.get("cod", "")).strip()
+    cod = "".join(ch for ch in cod if ch.isalnum())
+    return cod or "bacia"
+
+
+def _nome_saida(base: str, ext: str) -> str:
+    """Ex.: _nome_saida('chuva_media', 'csv') → '39480000_chuva_media.csv'."""
+    return f"{_cod_saida()}_{base}.{ext}"
+
+
 def _metadata_dict() -> dict:
     b = ss.bacia
     meta = {
@@ -367,7 +382,8 @@ if idx_bhae is not None:
     res_b = bo.buscar(idx_bhae, termo_b).head(30) if termo_b else idx_bhae.head(0)
     if len(res_b):
         labels_b = [f"{'⚠️ ' if not r.geometria_confiavel else ''}{r.cod_posto} · "
-                    f"{r.nome_posto} · {r.area_usada_km2:,.0f} km² · {r.rio_bhae}"
+                    f"{r.nome_posto} · {r.area_usada_km2:,.0f} km²"
+                    f"{'' if r.geometria_confiavel else ' · ' + str(r.status)}"
                     .replace(",", ".")
                     for r in res_b.itertuples()]
         escolha_b = st.selectbox("Resultado", labels_b, key="sel_bhae",
@@ -422,13 +438,13 @@ with col1:
                        "a seleção de postos PLU podem não representar a bacia real.")
         st.download_button("Baixar limite da bacia (GeoJSON)",
                            _geojson_bytes(b.polygon),
-                           file_name="bacia_consolidada.geojson",
+                           file_name=_nome_saida("bacia_consolidada", "geojson"),
                            mime="application/geo+json",
                            use_container_width=True)
         st.download_button("Baixar metadados da bacia (JSON)",
                            json.dumps(_metadata_dict(), ensure_ascii=False,
                                       indent=2).encode("utf-8"),
-                           file_name="metadados_bacia.json",
+                           file_name=_nome_saida("metadados_bacia", "json"),
                            mime="application/json",
                            use_container_width=True)
     else:
@@ -477,7 +493,7 @@ if ss.postos_sel is not None:
     st.dataframe(s.postos[cols].round(4), use_container_width=True, height=240)
     st.download_button("Baixar postos e pesos IDW (CSV)",
                        s.postos.drop(columns="geometry", errors="ignore").to_csv(index=False).encode("utf-8"),
-                       file_name="postos_plu_idw.csv", mime="text/csv")
+                       file_name=_nome_saida("postos_plu_idw", "csv"), mime="text/csv")
 
 
 # ==========================================================================
@@ -611,7 +627,7 @@ if ss.chuva_media is not None:
     out.index.name = "data"
     st.download_button("Baixar chuva média (CSV)",
                        out.to_csv().encode("utf-8"),
-                       file_name="chuva_media_bacia.csv", mime="text/csv")
+                       file_name=_nome_saida("chuva_media_bacia", "csv"), mime="text/csv")
 
 
 # ==========================================================================
@@ -635,7 +651,7 @@ else:
     st.metric("ETP média anual da bacia", f"{etp_anual:,.0f} mm/ano")
     st.download_button("Baixar ETP mensal da bacia (CSV)",
                        df_etp.to_csv(index=False).encode("utf-8"),
-                       file_name="etp_mensal_bacia.csv", mime="text/csv")
+                       file_name=_nome_saida("etp_mensal_bacia", "csv"), mime="text/csv")
 
 
 # ==========================================================================
@@ -648,23 +664,24 @@ if ss.bacia is not None:
     import zipfile
     pacote = io.BytesIO()
     with zipfile.ZipFile(pacote, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("bacia_consolidada.geojson", _geojson_bytes(ss.bacia.polygon))
-        z.writestr("metadados_bacia.json", json.dumps(_metadata_dict(), ensure_ascii=False, indent=2))
+        _dir = f"{_cod_saida()}_pacote_bacia/"
+        z.writestr(_dir + _nome_saida("bacia_consolidada", "geojson"), _geojson_bytes(ss.bacia.polygon))
+        z.writestr(_dir + _nome_saida("metadados_bacia", "json"), json.dumps(_metadata_dict(), ensure_ascii=False, indent=2))
         if ss.etp_mensal is not None:
-            z.writestr("etp_mensal_bacia.csv", ss.etp_mensal.to_csv(index=False))
+            z.writestr(_dir + _nome_saida("etp_mensal_bacia", "csv"), ss.etp_mensal.to_csv(index=False))
         if ss.chuva_media is not None:
             out = ss.chuva_media.rainfall.dropna().rename("p").to_frame()
             out.index.name = "data"
-            z.writestr("chuva_media_bacia.csv", out.to_csv())
+            z.writestr(_dir + _nome_saida("chuva_media_bacia", "csv"), out.to_csv())
         if ss.get("vazao") is not None:
             qv = ss.vazao.dropna().rename("q_m3s").to_frame()
             qv.index.name = "data"
-            z.writestr("vazao_exutorio.csv", qv.to_csv())
+            z.writestr(_dir + _nome_saida("vazao_exutorio", "csv"), qv.to_csv())
         if ss.postos_sel is not None:
-            z.writestr("postos_plu_idw.csv", ss.postos_sel.postos.drop(columns="geometry", errors="ignore").to_csv(index=False))
+            z.writestr(_dir + _nome_saida("postos_plu_idw", "csv"), ss.postos_sel.postos.drop(columns="geometry", errors="ignore").to_csv(index=False))
     st.download_button("Baixar pacote mínimo da bacia (.zip)",
                        pacote.getvalue(),
-                       file_name="cawm_pacote_bacia.zip",
+                       file_name=_nome_saida("cawm_pacote_bacia", "zip"),
                        mime="application/zip",
                        use_container_width=True)
 else:
