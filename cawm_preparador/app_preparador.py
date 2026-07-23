@@ -611,7 +611,26 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
         if not codes:
             st.error("Nenhuma série carregada. Baixe no Passo 3 ou suba manual.")
         else:
-            mat = pd.DataFrame({c: ss.series[c] for c in codes})
+            # --- Controle de qualidade por posto (antes do IDW) -----------
+            # Detecta e invalida: total mensal lançado como dado diário
+            # (assinatura: valor concentrado no último/primeiro dia do mês),
+            # valores fisicamente implausíveis e pluviômetro travado.
+            import consistencia_chuva as cq
+            series_uso = {c: ss.series[c] for c in codes}
+            rel_qc, series_uso = cq.auditar_conjunto(series_uso)
+            if len(rel_qc):
+                n_postos_qc = rel_qc["cod"].nunique()
+                st.warning(f"Controle de qualidade: {len(rel_qc)} valor(es) "
+                           f"suspeito(s) invalidado(s) em {n_postos_qc} posto(s) — "
+                           "predominantemente totais mensais lançados como "
+                           "dado diário (HidroWeb).")
+                with st.expander("Detalhe do controle de qualidade", expanded=False):
+                    st.dataframe(rel_qc, use_container_width=True)
+                    st.download_button("Baixar relatório de QC (CSV)",
+                                       rel_qc.to_csv(index=False).encode("utf-8"),
+                                       file_name=_nome_saida("qc_chuva", "csv"),
+                                       mime="text/csv")
+            mat = pd.DataFrame(series_uso)
             weights = [peso_por_cod.get(_norm(c), 1.0) for c in codes]
             res = idw.basin_mean_rainfall(mat, weights=weights,
                                           min_coverage=min_cov)
