@@ -617,7 +617,12 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
             # valores fisicamente implausíveis e pluviômetro travado.
             import consistencia_chuva as cq
             series_uso = {c: ss.series[c] for c in codes}
-            rel_qc, series_uso = cq.auditar_conjunto(series_uso)
+            barra = st.progress(0.0, text="Controle de qualidade das séries…")
+            def _prog(i, n, cod):
+                barra.progress(i / n, text=f"Controle de qualidade: posto {cod} "
+                                           f"({i}/{n})")
+            rel_qc, series_uso = cq.auditar_conjunto(series_uso, progresso=_prog)
+            barra.progress(1.0, text="Calculando a média ponderada (IDW)…")
             if len(rel_qc):
                 n_postos_qc = rel_qc["cod"].nunique()
                 st.warning(f"Controle de qualidade: {len(rel_qc)} valor(es) "
@@ -634,6 +639,7 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
             weights = [peso_por_cod.get(_norm(c), 1.0) for c in codes]
             res = idw.basin_mean_rainfall(mat, weights=weights,
                                           min_coverage=min_cov)
+            barra.empty()
             ss.chuva_media = res
             st.success(f"{res.rainfall.notna().sum()} dias válidos · "
                        f"{len(codes)} postos no IDW · "

@@ -44,32 +44,35 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 def _flag_total_mensal(s: pd.Series, frac_mes: float = 0.8,
                        min_valor_mensal: float = 40.0) -> pd.DataFrame:
-    """T1: total do mês lançado como diário no último (ou primeiro) dia."""
-    flags = []
-    df = s.dropna().to_frame("v")
-    if df.empty:
+    """T1: total do mês lançado como diário no último (ou primeiro) dia.
+    VETORIZADO (transforms por grupo mensal, sem loop Python por mês) —
+    essencial para bacias com centenas de postos (ex. Óbidos: 915)."""
+    v = s.dropna()
+    if v.empty:
         return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
-    df["ym"] = df.index.to_period("M")
-    for ym, gm in df.groupby("ym"):
-        soma = float(gm["v"].sum())
-        if soma < min_valor_mensal:
-            continue
-        vmax = float(gm["v"].max())
-        if vmax < min_valor_mensal or (vmax / soma) < frac_mes:
-            continue
-        dia_max = gm["v"].idxmax()
-        ultimo_dia_cal = ym.to_timestamp("M")          # último dia do calendário
-        primeiro_dia_cal = ym.to_timestamp("D")        # dia 1
-        if dia_max.normalize() == ultimo_dia_cal.normalize():
-            pos = "último dia do mês"
-        elif dia_max.normalize() == primeiro_dia_cal.normalize():
-            pos = "primeiro dia do mês"
-        else:
-            continue  # concentração alta mas em dia qualquer: pode ser evento real isolado
-        flags.append({"data": dia_max, "valor": vmax, "teste": "total_mensal",
-                      "motivo": f"{vmax:.1f} mm no {pos} = "
-                                f"{100*vmax/soma:.0f}% do total do mês ({soma:.1f} mm)"})
-    return pd.DataFrame(flags)
+    ym = v.index.to_period("M")
+    g = v.groupby(ym)
+    soma = g.transform("sum")
+    vmax = g.transform("max")
+    e_max = v.eq(vmax)
+    # último dia do mês = o dia seguinte é dia 1 (aritmética pura, sem períodos)
+    ultimo = (v.index + pd.Timedelta(days=1)).day == 1
+    primeiro = v.index.day == 1
+    conc = (vmax / soma).where(soma > 0)
+    cand = (e_max & (vmax >= min_valor_mensal) & (soma >= min_valor_mensal)
+            & (conc >= frac_mes) & (ultimo | primeiro))
+    if not bool(cand.any()):
+        return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
+    sel = v[cand.values]
+    pos = np.where(sel.index.day == 1, "primeiro dia do mês", "último dia do mês")
+    fr = (sel.values / soma[cand.values].values) * 100
+    tot = soma[cand.values].values
+    return pd.DataFrame({
+        "data": sel.index, "valor": sel.values.astype(float),
+        "teste": "total_mensal",
+        "motivo": [f"{v_:.1f} mm no {p_} = {f_:.0f}% do total do mês ({t_:.1f} mm)"
+                   for v_, p_, f_, t_ in zip(sel.values, pos, fr, tot)],
+    })
 
 
 def _flag_limite_fisico(s: pd.Series, limite_fisico: float = 250.0) -> pd.DataFrame:
@@ -81,19 +84,27 @@ def _flag_limite_fisico(s: pd.Series, limite_fisico: float = 250.0) -> pd.DataFr
 
 
 def _flag_valor_repetido(s: pd.Series, n_repeticao: int = 5) -> pd.DataFrame:
-    """T3: n+ dias consecutivos com o mesmo valor não nulo."""
-    flags = []
+    """T3: n+ dias consecutivos com o mesmo valor não nulo. VETORIZADO —
+    o início do bloco só é computado para os (raros) blocos suspeitos."""
     v = s.dropna()
     if v.empty:
         return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
     grupo = (v != v.shift()).cumsum()
-    for _, bloco in v.groupby(grupo):
-        if len(bloco) >= n_repeticao and float(bloco.iloc[0]) > 0:
-            for d, val in bloco.items():
-                flags.append({"data": d, "valor": float(val), "teste": "valor_repetido",
-                              "motivo": f"{val:.1f} mm repetido por {len(bloco)} dias "
-                                        f"desde {bloco.index[0].date()}"})
-    return pd.DataFrame(flags)
+    tam = grupo.groupby(grupo).transform("size")
+    mask = (tam >= n_repeticao) & (v > 0)
+    if not bool(mask.any()):
+        return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
+    sel = v[mask]
+    g_sel = grupo[mask]
+    ini_por_grupo = sel.index.to_series().groupby(g_sel.values).min()
+    ini = g_sel.map(ini_por_grupo)
+    return pd.DataFrame({
+        "data": sel.index, "valor": sel.values.astype(float),
+        "teste": "valor_repetido",
+        "motivo": [f"{val:.1f} mm repetido por {t} dias desde {d0.date()}"
+                   for val, t, d0 in zip(sel.values, tam[mask].values,
+                                         pd.to_datetime(ini.values))],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +134,17 @@ def limpar_serie(s: pd.Series, flags: pd.DataFrame) -> pd.Series:
     return s2
 
 
-def auditar_conjunto(series: dict, **kwargs):
+def auditar_conjunto(series: dict, progresso=None, **kwargs):
     """Audita um dicionário {cod_posto: serie}. Retorna (relatorio, series_limpas).
-    relatorio: DataFrame [cod, data, valor, teste, motivo]."""
+    relatorio: DataFrame [cod, data, valor, teste, motivo].
+
+    `progresso`: callback opcional f(i, n, cod) chamado a cada posto — permite
+    barra de progresso na interface sem acoplar este módulo ao Streamlit."""
     rel, limpas = [], {}
-    for cod, s in series.items():
+    n = len(series)
+    for i, (cod, s) in enumerate(series.items(), start=1):
+        if progresso is not None:
+            progresso(i, n, str(cod))
         flags = auditar_serie(s, **kwargs)
         if len(flags):
             f2 = flags.copy()
