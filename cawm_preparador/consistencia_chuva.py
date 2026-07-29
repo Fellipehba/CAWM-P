@@ -58,7 +58,12 @@ def _flag_total_mensal(s: pd.Series, frac_mes: float = 0.8,
     # último dia do mês = o dia seguinte é dia 1 (aritmética pura, sem períodos)
     ultimo = (v.index + pd.Timedelta(days=1)).day == 1
     primeiro = v.index.day == 1
-    conc = (vmax / soma).where(soma > 0)
+    # concentração = vmax/soma, calculada só onde soma>0 (evita 0/0 em meses
+    # inteiramente secos; where() sozinho não basta, pois a divisão ocorre antes)
+    conc = pd.Series(np.divide(vmax.values, soma.values,
+                               out=np.zeros(len(vmax), dtype="float64"),
+                               where=soma.values > 0),
+                     index=v.index)
     cand = (e_max & (vmax >= min_valor_mensal) & (soma >= min_valor_mensal)
             & (conc >= frac_mes) & (ultimo | primeiro))
     if not bool(cand.any()):
