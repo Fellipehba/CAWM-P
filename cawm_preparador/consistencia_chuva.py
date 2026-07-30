@@ -42,12 +42,34 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+def _serie_float(s: pd.Series) -> pd.Series:
+    """Normaliza a série para float64 puro, índice datetime, sem NaN.
+
+    As séries da ANA chegam com dtypes variados (object com vírgula decimal,
+    Int64/Float64 nullable do pandas, ou já float). Normalizar UMA VEZ aqui
+    evita erro de casting em cada operação vetorizada dos testes."""
+    v = s.copy()
+    if not isinstance(v.index, pd.DatetimeIndex):
+        v.index = pd.to_datetime(v.index, errors="coerce")
+    if v.dtype == object:
+        # texto brasileiro: "1.234,5" → "1234.5"; "130,0" → "130.0".
+        # Sem isso, pd.to_numeric transformaria em NaN silenciosamente.
+        t = v.astype(str).str.strip()
+        tem_virgula = t.str.contains(",", na=False)
+        t = t.mask(tem_virgula,
+                   t.str.replace(".", "", regex=False).str.replace(",", ".",
+                                                                  regex=False))
+        v = t.replace({"None": None, "nan": None, "": None})
+    v = pd.to_numeric(v, errors="coerce").astype("float64")
+    return v[v.notna() & v.index.notna()]
+
+
 def _flag_total_mensal(s: pd.Series, frac_mes: float = 0.8,
                        min_valor_mensal: float = 40.0) -> pd.DataFrame:
     """T1: total do mês lançado como diário no último (ou primeiro) dia.
     VETORIZADO (transforms por grupo mensal, sem loop Python por mês) —
     essencial para bacias com centenas de postos (ex. Óbidos: 915)."""
-    v = s.dropna()
+    v = _serie_float(s)
     if v.empty:
         return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
     ym = v.index.to_period("M")
@@ -58,12 +80,14 @@ def _flag_total_mensal(s: pd.Series, frac_mes: float = 0.8,
     # último dia do mês = o dia seguinte é dia 1 (aritmética pura, sem períodos)
     ultimo = (v.index + pd.Timedelta(days=1)).day == 1
     primeiro = v.index.day == 1
-    # concentração = vmax/soma, calculada só onde soma>0 (evita 0/0 em meses
-    # inteiramente secos; where() sozinho não basta, pois a divisão ocorre antes)
-    conc = pd.Series(np.divide(vmax.values, soma.values,
-                               out=np.zeros(len(vmax), dtype="float64"),
-                               where=soma.values > 0),
-                     index=v.index)
+    # concentração = vmax/soma. Divide APENAS onde soma>0, por máscara booleana
+    # (sem np.divide/out=, que falha com dtypes nullable Int64/Float64 da ANA).
+    soma_v = soma.to_numpy(dtype="float64", na_value=np.nan)
+    vmax_v = vmax.to_numpy(dtype="float64", na_value=np.nan)
+    conc_v = np.zeros(len(v), dtype="float64")
+    pos_ok = soma_v > 0
+    conc_v[pos_ok] = vmax_v[pos_ok] / soma_v[pos_ok]
+    conc = pd.Series(conc_v, index=v.index)
     cand = (e_max & (vmax >= min_valor_mensal) & (soma >= min_valor_mensal)
             & (conc >= frac_mes) & (ultimo | primeiro))
     if not bool(cand.any()):
@@ -82,7 +106,8 @@ def _flag_total_mensal(s: pd.Series, frac_mes: float = 0.8,
 
 def _flag_limite_fisico(s: pd.Series, limite_fisico: float = 250.0) -> pd.DataFrame:
     """T2: acima do plausível físico diário."""
-    sus = s[s > limite_fisico].dropna()
+    v = _serie_float(s)
+    sus = v[v > limite_fisico]
     return pd.DataFrame([{"data": d, "valor": float(v), "teste": "limite_fisico",
                           "motivo": f"{v:.1f} mm > limite {limite_fisico:.0f} mm/dia"}
                          for d, v in sus.items()])
@@ -91,7 +116,7 @@ def _flag_limite_fisico(s: pd.Series, limite_fisico: float = 250.0) -> pd.DataFr
 def _flag_valor_repetido(s: pd.Series, n_repeticao: int = 5) -> pd.DataFrame:
     """T3: n+ dias consecutivos com o mesmo valor não nulo. VETORIZADO —
     o início do bloco só é computado para os (raros) blocos suspeitos."""
-    v = s.dropna()
+    v = _serie_float(s)
     if v.empty:
         return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
     grupo = (v != v.shift()).cumsum()
