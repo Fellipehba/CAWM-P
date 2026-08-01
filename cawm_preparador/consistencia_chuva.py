@@ -156,20 +156,63 @@ def auditar_serie(s: pd.Series, frac_mes: float = 0.8,
         .reset_index(drop=True)
 
 
-def limpar_serie(s: pd.Series, flags: pd.DataFrame) -> pd.Series:
-    """Devolve cópia da série com os dias marcados → NaN (invalidados)."""
-    s2 = s.copy()
-    if len(flags):
-        s2.loc[s2.index.isin(pd.to_datetime(flags["data"]))] = np.nan
-    return s2
+def limpar_serie(s: pd.Series, flags: pd.DataFrame,
+                 invalidar=("total_mensal",),
+                 modo_total_mensal: str = "mes") -> pd.Series:
+    """Devolve cópia da série com os dias INVALIDADOS (→ NaN).
+
+    Separa deliberadamente *sinalizar* de *invalidar*:
+
+    `invalidar`: quais testes de fato removem dado. Por padrão **apenas
+        `total_mensal`** — os testes `limite_fisico` e `valor_repetido` ficam
+        como ALERTA (aparecem no relatório, não alteram a série), pois um
+        valor extremo pode ser real e valores repetidos podem ser chuva
+        legítima. Para invalidá-los, passe p.ex. ("total_mensal","limite_fisico").
+
+    `modo_total_mensal`:
+      * "mes" (padrão) — invalida o MÊS INTEIRO daquele posto. Motivo: quando o
+        total do mês é lançado num dia só, os demais dias ficam com ZERO que
+        NÃO é medição. Deixá-los introduz viés sistemático negativo (medido:
+        −0,44 mm/dia num experimento controlado). Com o mês em NaN, o IDW usa
+        os outros postos e a média fica sem viés (+0,02 mm/dia).
+      * "dia" — invalida somente o dia do lançamento (alteração mínima do
+        registro). Preserva mais dado bruto, mas mantém o viés acima.
+    """
+    limpa = s.copy()
+    if flags is None or len(flags) == 0:
+        return limpa
+    usar = flags[flags["teste"].isin(invalidar)]
+    if not len(usar):
+        return limpa
+    datas = pd.to_datetime(usar["data"])
+    idx = limpa.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        idx = pd.to_datetime(idx, errors="coerce")
+    tm = usar["teste"] == "total_mensal"
+    # dias marcados por testes que não o total_mensal → sempre pontuais
+    pontuais = pd.to_datetime(usar.loc[~tm, "data"])
+    if len(pontuais):
+        limpa[idx.isin(pontuais)] = np.nan
+    if bool(tm.any()):
+        d_tm = pd.to_datetime(usar.loc[tm, "data"])
+        if modo_total_mensal == "mes":
+            meses = set(d_tm.dt.to_period("M"))
+            limpa[pd.Index(idx.to_period("M")).isin(meses)] = np.nan
+        else:
+            limpa[idx.isin(d_tm)] = np.nan
+    return limpa
 
 
-def auditar_conjunto(series: dict, progresso=None, **kwargs):
+def auditar_conjunto(series: dict, progresso=None,
+                     invalidar=("total_mensal",),
+                     modo_total_mensal: str = "mes", **kwargs):
     """Audita um dicionário {cod_posto: serie}. Retorna (relatorio, series_limpas).
     relatorio: DataFrame [cod, data, valor, teste, motivo].
 
     `progresso`: callback opcional f(i, n, cod) chamado a cada posto — permite
-    barra de progresso na interface sem acoplar este módulo ao Streamlit."""
+    barra de progresso na interface sem acoplar este módulo ao Streamlit.
+    `invalidar` / `modo_total_mensal`: ver `limpar_serie` (por padrão só o
+    total_mensal invalida, e invalida o mês inteiro do posto)."""
     rel, limpas = [], {}
     n = len(series)
     for i, (cod, s) in enumerate(series.items(), start=1):
@@ -180,9 +223,15 @@ def auditar_conjunto(series: dict, progresso=None, **kwargs):
             f2 = flags.copy()
             f2.insert(0, "cod", str(cod))
             rel.append(f2)
-            limpas[cod] = limpar_serie(s, flags)
+            limpas[cod] = limpar_serie(s, flags, invalidar=invalidar,
+                                       modo_total_mensal=modo_total_mensal)
         else:
             limpas[cod] = s
     relatorio = pd.concat(rel, ignore_index=True) if rel else \
         pd.DataFrame(columns=["cod", "data", "valor", "teste", "motivo"])
+    if len(relatorio):
+        relatorio["acao"] = np.where(
+            relatorio["teste"].isin(invalidar),
+            ("mês invalidado" if modo_total_mensal == "mes" else "dia invalidado"),
+            "apenas alerta")
     return relatorio, limpas

@@ -594,6 +594,17 @@ if ss.get("vazao") is not None:
 # Passo 4 — Chuva média
 # ==========================================================================
 st.subheader("Passo 4 · Chuva média da bacia")
+modo_qc = st.radio(
+    "Controle de qualidade — total mensal lançado como dado diário",
+    ["Mês do posto (recomendado)", "Somente o dia do lançamento"],
+    horizontal=True,
+    help="Quando o total do mês é lançado num único dia, os demais dias do mês "
+         "ficam com ZERO que não é medição. Invalidar o mês inteiro daquele "
+         "posto remove o viés (medido: +0,02 mm/dia contra −0,44 mm/dia se só "
+         "o dia for invalidado); o IDW usa os outros postos nesses dias. "
+         "A opção 'somente o dia' altera menos o registro bruto, mas mantém "
+         "os zeros falsos. Extremos físicos e valores repetidos são apenas "
+         "sinalizados, nunca removidos.")
 if st.button("Calcular chuva média (IDW)", type="primary"):
     if ss.postos_sel is None or not ss.series:
         st.error("Selecione postos (Passo 2) e carregue séries (Passo 3).")
@@ -621,14 +632,21 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
             def _prog(i, n, cod):
                 barra.progress(i / n, text=f"Controle de qualidade: posto {cod} "
                                            f"({i}/{n})")
-            rel_qc, series_uso = cq.auditar_conjunto(series_uso, progresso=_prog)
+            rel_qc, series_uso = cq.auditar_conjunto(
+                series_uso, progresso=_prog,
+                modo_total_mensal=("mes" if modo_qc.startswith("Mês") else "dia"))
             barra.progress(1.0, text="Calculando a média ponderada (IDW)…")
             if len(rel_qc):
                 n_postos_qc = rel_qc["cod"].nunique()
-                st.warning(f"Controle de qualidade: {len(rel_qc)} valor(es) "
-                           f"suspeito(s) invalidado(s) em {n_postos_qc} posto(s) — "
-                           "predominantemente totais mensais lançados como "
-                           "dado diário (HidroWeb).")
+                n_inval = int((rel_qc["acao"] != "apenas alerta").sum())
+                n_alerta = int((rel_qc["acao"] == "apenas alerta").sum())
+                st.warning(
+                    f"Controle de qualidade em {n_postos_qc} posto(s): "
+                    f"**{n_inval}** lançamento(s) de total mensal invalidado(s) "
+                    f"({'mês inteiro do posto' if modo_qc.startswith('Mês') else 'somente o dia'})"
+                    + (f" · **{n_alerta}** ocorrência(s) apenas sinalizada(s) "
+                       "(extremo físico / valor repetido), sem alterar o dado."
+                       if n_alerta else "."))
                 with st.expander("Detalhe do controle de qualidade", expanded=False):
                     st.dataframe(rel_qc, use_container_width=True)
                     st.download_button("Baixar relatório de QC (CSV)",
