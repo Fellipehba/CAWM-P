@@ -51,6 +51,7 @@ def _bhae_bacias_disponivel():
     from pathlib import Path
     return Path(BHAE_BACIAS).exists() or str(BHAE_BACIAS).startswith("http")
 import selecao_postos as sp
+import consistencia_chuva as cq
 import chuva_media_idw as idw
 import aquisicao_ana as ana
 import inventario as invmod
@@ -86,6 +87,7 @@ ss.setdefault("trechos", None)
 ss.setdefault("areas", None)
 ss.setdefault("series", {})
 ss.setdefault("chuva_media", None)
+ss.setdefault("rel_qc", None)
 ss.setdefault("etp_mensal", None)
 ss.setdefault("aq", ana.AquisicaoANA(api=None))
 ss.setdefault("lon", -35.3056)
@@ -436,17 +438,6 @@ with col1:
         if _msg:
             st.warning("⚠️ " + _msg + " Você pode prosseguir, mas o contorno e "
                        "a seleção de postos PLU podem não representar a bacia real.")
-        st.download_button("Baixar limite da bacia (GeoJSON)",
-                           _geojson_bytes(b.polygon),
-                           file_name=_nome_saida("bacia_consolidada", "geojson"),
-                           mime="application/geo+json",
-                           use_container_width=True)
-        st.download_button("Baixar metadados da bacia (JSON)",
-                           json.dumps(_metadata_dict(), ensure_ascii=False,
-                                      indent=2).encode("utf-8"),
-                           file_name=_nome_saida("metadados_bacia", "json"),
-                           mime="application/json",
-                           use_container_width=True)
     else:
         st.info("Carregue uma bacia acima (busca por posto FLU).")
 with col2:
@@ -491,9 +482,6 @@ if ss.postos_sel is not None:
     c3.metric("No buffer", s.n_buffer)
     cols = [c for c in ["cod", "nome", "tipo", "dentro", "dist_borda_km", "peso_idw"] if c in s.postos.columns]
     st.dataframe(s.postos[cols].round(4), use_container_width=True, height=240)
-    st.download_button("Baixar postos e pesos IDW (CSV)",
-                       s.postos.drop(columns="geometry", errors="ignore").to_csv(index=False).encode("utf-8"),
-                       file_name=_nome_saida("postos_plu_idw", "csv"), mime="text/csv")
 
 
 # ==========================================================================
@@ -504,8 +492,10 @@ st.subheader("Passo 3 · Séries da ANA (chuva dos postos + vazão do exutório)
 # --- Opção A: download automático da ANA (HydroBR refatorado, sem token) ----
 if ss.postos_sel is not None:
     cods_plu = [str(c) for c in ss.postos_sel.postos["cod"]]
-    if st.button(f"⬇ Baixar chuva dos {len(cods_plu)} postos PLU (ANA)",
-                 type="primary"):
+    _cod_flu_pre = ((ss.exutorio_estacao or {}).get("cod", "") or "").strip()
+    if st.button(f"⬇ Baixar séries da ANA — chuva de {len(cods_plu)} postos PLU"
+                 + (f" + vazão do exutório {_cod_flu_pre}" if _cod_flu_pre else ""),
+                 type="primary", use_container_width=True):
         try:
             import ana_hydrobr as ah
         except Exception as e:
@@ -555,39 +545,31 @@ if ss.postos_sel is not None:
             if n_ok == 0 and not primeiro_erro:
                 st.warning("Nenhum posto retornou dados. Veja a coluna 'motivo' "
                            "na tabela abaixo.")
+            # vazão do exutório no MESMO clique (evita botão separado)
+            if _cod_flu_pre:
+                try:
+                    with st.spinner(f"Baixando vazão da estação {_cod_flu_pre}…"):
+                        sv = ah.baixar_vazao(_cod_flu_pre, only_consisted=False)
+                    if sv is not None and sv.notna().any():
+                        ss.vazao = sv
+                        st.success(f"Vazão do exutório: {int(sv.notna().sum())} dias "
+                                   f"({sv.index.min().date()}–{sv.index.max().date()}), "
+                                   f"média {float(sv.mean()):.1f} m³/s.")
+                    else:
+                        st.warning("A estação do exutório não retornou vazão na ANA.")
+                except Exception as e:
+                    st.error(f"Falha ao baixar a vazão do exutório: {e}")
+            else:
+                st.info("Sem estação FLU definida no Passo 1 — vazão não baixada.")
     if ss.get("download_status"):
         st.dataframe(pd.DataFrame(ss.download_status), use_container_width=True,
                      height=200)
 else:
     st.info("Selecione os postos PLU no Passo 2 para habilitar o download automático.")
 
-# --- Vazão do exutório (mesma estação FLU do Passo 1, sem redigitar) -------
-st.markdown("**Vazão observada do exutório**")
-cod_flu = (ss.exutorio_estacao or {}).get("cod", "").strip() if ss.get("exutorio_estacao") else ""
-if cod_flu:
-    st.caption(f"Estação do exutório (Passo 1): {cod_flu} · "
-               f"{(ss.exutorio_estacao or {}).get('nome', '')}")
-else:
-    st.info("Escolha o exutório por estação FLU no Passo 1 para baixar a vazão automaticamente.")
-if st.button("⬇ Baixar vazão do exutório (ANA)", disabled=not cod_flu):
-    if not cod_flu:
-        st.error("Defina o exutório por estação no Passo 1.")
-    else:
-        try:
-            import ana_hydrobr as ah
-            with st.spinner(f"Baixando vazão da estação {cod_flu}…"):
-                sv = ah.baixar_vazao(cod_flu.strip(), only_consisted=False)
-            if sv.notna().any():
-                ss.vazao = sv
-                st.success(f"Vazão baixada: {int(sv.notna().sum())} dias válidos, "
-                           f"{sv.index.min().date()}–{sv.index.max().date()}, "
-                           f"média {float(sv.mean()):.1f} m³/s.")
-            else:
-                st.warning("A estação não retornou vazão na ANA. Tente outro código ou upload manual.")
-        except Exception as e:
-            st.error(f"Falha ao baixar vazão: {e}")
 if ss.get("vazao") is not None:
-    st.caption(f"Vazão do exutório carregada ({int(ss.vazao.notna().sum())} dias).")
+    st.caption(f"Vazão do exutório carregada ({int(ss.vazao.notna().sum())} dias) — "
+               "baixada junto com a chuva, no mesmo botão.")
 
 
 # ==========================================================================
@@ -626,16 +608,17 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
             # Detecta e invalida: total mensal lançado como dado diário
             # (assinatura: valor concentrado no último/primeiro dia do mês),
             # valores fisicamente implausíveis e pluviômetro travado.
-            import consistencia_chuva as cq
             series_uso = {c: ss.series[c] for c in codes}
             barra = st.progress(0.0, text="Controle de qualidade das séries…")
             def _prog(i, n, cod):
                 barra.progress(i / n, text=f"Controle de qualidade: posto {cod} "
                                            f"({i}/{n})")
+            ss.rel_qc = None
             rel_qc, series_uso = cq.auditar_conjunto(
                 series_uso, progresso=_prog,
                 modo_total_mensal=("mes" if modo_qc.startswith("Mês") else "dia"))
             barra.progress(1.0, text="Calculando a média ponderada (IDW)…")
+            ss.rel_qc = rel_qc
             if len(rel_qc):
                 n_postos_qc = rel_qc["cod"].nunique()
                 n_inval = int((rel_qc["acao"] != "apenas alerta").sum())
@@ -649,10 +632,6 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
                        if n_alerta else "."))
                 with st.expander("Detalhe do controle de qualidade", expanded=False):
                     st.dataframe(rel_qc, use_container_width=True)
-                    st.download_button("Baixar relatório de QC (CSV)",
-                                       rel_qc.to_csv(index=False).encode("utf-8"),
-                                       file_name=_nome_saida("qc_chuva", "csv"),
-                                       mime="text/csv")
             mat = pd.DataFrame(series_uso)
             weights = [peso_por_cod.get(_norm(c), 1.0) for c in codes]
             res = idw.basin_mean_rainfall(mat, weights=weights,
@@ -666,11 +645,19 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
 if ss.chuva_media is not None:
     res = ss.chuva_media
     st.line_chart(res.rainfall.dropna().rename("Chuva média (mm/d)"))
-    out = res.rainfall.dropna().rename("p").to_frame()
-    out.index.name = "data"
-    st.download_button("Baixar chuva média (CSV)",
-                       out.to_csv().encode("utf-8"),
-                       file_name=_nome_saida("chuva_media_bacia", "csv"), mime="text/csv")
+
+    # --- Auditoria da média da bacia (só ALERTA, não altera o dado) --------
+    alertas = cq.auditar_media_bacia(res.rainfall.dropna())
+    if len(alertas):
+        st.warning(
+            f"⚠️ {len(alertas)} dia(s) com chuva média implausível para a "
+            "escala desta bacia (valor acima do teto derivado da própria série "
+            "**e** isolado num período seco). Não foram alterados — revise "
+            "antes de usar na calibração.")
+        st.dataframe(alertas, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Auditoria da média da bacia: nenhum valor implausível "
+                   "para a escala da bacia.")
 
 
 # ==========================================================================
@@ -692,9 +679,6 @@ else:
                  use_container_width=True, hide_index=True)
     etp_anual = float(df_etp["etp_mm_mes"].sum())
     st.metric("ETP média anual da bacia", f"{etp_anual:,.0f} mm/ano")
-    st.download_button("Baixar ETP mensal da bacia (CSV)",
-                       df_etp.to_csv(index=False).encode("utf-8"),
-                       file_name=_nome_saida("etp_mensal_bacia", "csv"), mime="text/csv")
 
 
 # ==========================================================================
@@ -713,9 +697,24 @@ if ss.bacia is not None:
         if ss.etp_mensal is not None:
             z.writestr(_dir + _nome_saida("etp_mensal_bacia", "csv"), ss.etp_mensal.to_csv(index=False))
         if ss.chuva_media is not None:
-            out = ss.chuva_media.rainfall.dropna().rename("p").to_frame()
+            _cm = ss.chuva_media
+            out = _cm.rainfall.dropna().rename("p").to_frame()
+            # cobertura = fração de postos válidos no dia. Essencial para
+            # distinguir evento real de artefato de rede rala (ex.: platôs
+            # altos em séries antigas com poucos postos reportando).
+            try:
+                out["cobertura"] = _cm.coverage.reindex(out.index).round(3)
+            except Exception:
+                pass
             out.index.name = "data"
             z.writestr(_dir + _nome_saida("chuva_media_bacia", "csv"), out.to_csv())
+            _al = cq.auditar_media_bacia(_cm.rainfall.dropna())
+            if len(_al):
+                z.writestr(_dir + _nome_saida("alertas_chuva_media", "csv"),
+                           _al.to_csv(index=False))
+        if ss.get("rel_qc") is not None and len(ss.rel_qc):
+            z.writestr(_dir + _nome_saida("qc_chuva_postos", "csv"),
+                       ss.rel_qc.to_csv(index=False))
         if ss.get("vazao") is not None:
             qv = ss.vazao.dropna().rename("q_m3s").to_frame()
             qv.index.name = "data"

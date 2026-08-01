@@ -203,6 +203,65 @@ def limpar_serie(s: pd.Series, flags: pd.DataFrame,
     return limpa
 
 
+def auditar_media_bacia(p: pd.Series, k_mad: float = 5.0,
+                        frac_isolado: float = 0.6,
+                        janela: int = 11) -> pd.DataFrame:
+    """Auditoria da CHUVA MÉDIA DA BACIA (camada complementar à auditoria por
+    posto). Somente ALERTA — nunca altera o dado.
+
+    Motivação: um erro grosseiro num único posto com peso alto no IDW produz,
+    na média, um valor impossível para a ESCALA daquela bacia — mas que seria
+    plausível num pluviômetro. Ex.: 94,7 mm/d na média de uma bacia de 4,67
+    milhões de km² (Óbidos) implica ~270–1900 mm no posto de origem.
+
+    Dois critérios COMBINADOS, ambos necessários:
+
+    1. **Teto autocalibrado** = mediana + `k_mad`·MAD dos MÁXIMOS ANUAIS da
+       própria série. Não é constante nacional: deriva do regime e da escala
+       da bacia. Validado em 4 bacias reais (correlação teto × log(área) =
+       −0,985, refletindo o amortecimento espacial da chuva):
+           181 km² (Eng. Florescente, úmida) → 134 mm/d
+         4.910 km² (Palmares, + semiárido)   →  84 mm/d
+         6.550 km² (Barreiros, mista)        →  96 mm/d
+         4,67 M km² (Óbidos, continental)    →  28 mm/d
+
+    2. **Isolamento**: o dia concentra mais que `frac_isolado` da chuva da
+       janela de `janela` dias centrada nele. Distingue ERRO (pico isolado em
+       período seco) de CHEIA REAL (pico dentro de período chuvoso). Foi este
+       critério que preservou as cheias documentadas de junho/2010 e
+       maio/2011 na bacia do Una, sinalizando apenas os episódios isolados.
+
+    Retorna DataFrame [data, valor, teste, motivo] (vazio se nada suspeito).
+    """
+    v = _serie_float(p)
+    vazio = pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
+    if v.empty:
+        return vazio
+    amax = v.resample("YE").max()
+    amax = amax[amax > 0]
+    if len(amax) < 3:
+        return vazio
+    med_a = float(amax.median())
+    mad_a = float((amax - med_a).abs().median())
+    teto = med_a + k_mad * mad_a
+    if not np.isfinite(teto) or teto <= 0:
+        return vazio
+    soma_jan = v.rolling(janela, center=True, min_periods=3).sum()
+    frac = (v / soma_jan.replace(0, np.nan)).fillna(0.0)
+    cand = (v > teto) & (frac > frac_isolado)
+    if not bool(cand.any()):
+        return vazio
+    sel = v[cand]
+    ao_redor = (soma_jan[cand] - sel)
+    return pd.DataFrame({
+        "data": sel.index, "valor": sel.values.astype(float),
+        "teste": "implausivel_para_escala",
+        "motivo": [f"{val:.1f} mm/d excede o teto da bacia ({teto:.1f} mm/d) e é "
+                   f"isolado: apenas {ar:.1f} mm nos {janela-1} dias ao redor"
+                   for val, ar in zip(sel.values, ao_redor.values)],
+    }).reset_index(drop=True)
+
+
 def auditar_conjunto(series: dict, progresso=None,
                      invalidar=("total_mensal",),
                      modo_total_mensal: str = "mes", **kwargs):
