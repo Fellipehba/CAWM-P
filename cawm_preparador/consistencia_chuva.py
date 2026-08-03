@@ -104,24 +104,51 @@ def _flag_total_mensal(s: pd.Series, frac_mes: float = 0.8,
     })
 
 
-def _flag_limite_fisico(s: pd.Series, limite_fisico: float = 250.0) -> pd.DataFrame:
-    """T2: acima do plausível físico diário."""
+def _flag_limite_fisico(s: pd.Series, limite_fisico: float = 250.0,
+                        k_mad: float = 6.0) -> pd.DataFrame:
+    """T2: valor acima do plausível para AQUELE posto.
+
+    O limite fixo de 250 mm/dia mostrou-se baixo demais no litoral de
+    Pernambuco: sinalizou 250,6 mm (2011-05-03), 378,2 mm (2019-10-20) e
+    397,5 mm (2017-05-28) — extremos provavelmente REAIS (maio/2011 é cheia
+    documentada). Passa a valer o MAIOR entre:
+      * `limite_fisico` (piso absoluto — abaixo disso nada é suspeito), e
+      * mediana + `k_mad`·MAD dos máximos anuais do próprio posto
+        (autocalibração ao regime local, mesma lógica já validada para a
+        média da bacia).
+    Assim, um posto litorâneo que rotineiramente registra 200-300 mm/dia não
+    é acusado, mas um valor fora da sua própria distribuição é."""
     v = _serie_float(s)
-    sus = v[v > limite_fisico]
-    return pd.DataFrame([{"data": d, "valor": float(v), "teste": "limite_fisico",
-                          "motivo": f"{v:.1f} mm > limite {limite_fisico:.0f} mm/dia"}
-                         for d, v in sus.items()])
+    if v.empty:
+        return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
+    limite = float(limite_fisico)
+    amax = v.resample("YE").max()
+    amax = amax[amax > 0]
+    if len(amax) >= 5:
+        med = float(amax.median())
+        mad = float((amax - med).abs().median())
+        limite = max(limite, med + k_mad * mad)
+    sus = v[v > limite]
+    return pd.DataFrame([{"data": d, "valor": float(val), "teste": "limite_fisico",
+                          "motivo": f"{val:.1f} mm > limite do posto "
+                                    f"({limite:.0f} mm/dia)"}
+                         for d, val in sus.items()])
 
 
-def _flag_valor_repetido(s: pd.Series, n_repeticao: int = 5) -> pd.DataFrame:
-    """T3: n+ dias consecutivos com o mesmo valor não nulo. VETORIZADO —
-    o início do bloco só é computado para os (raros) blocos suspeitos."""
+def _flag_valor_repetido(s: pd.Series, n_repeticao: int = 5,
+                         min_valor: float = 1.0) -> pd.DataFrame:
+    """T3: n+ dias consecutivos com o MESMO valor, acima de `min_valor`.
+
+    `min_valor` (1,0 mm) evita acusar garoa trivial: o teste disparava com
+    "0,1 mm repetido por 5 dias", que é chuva fraca real e não pluviômetro
+    travado. VETORIZADO — o início do bloco só é computado para os (raros)
+    blocos suspeitos."""
     v = _serie_float(s)
     if v.empty:
         return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
     grupo = (v != v.shift()).cumsum()
     tam = grupo.groupby(grupo).transform("size")
-    mask = (tam >= n_repeticao) & (v > 0)
+    mask = (tam >= n_repeticao) & (v >= min_valor)
     if not bool(mask.any()):
         return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
     sel = v[mask]

@@ -88,6 +88,7 @@ ss.setdefault("areas", None)
 ss.setdefault("series", {})
 ss.setdefault("chuva_media", None)
 ss.setdefault("rel_qc", None)
+ss.setdefault("series_qc", None)
 ss.setdefault("etp_mensal", None)
 ss.setdefault("aq", ana.AquisicaoANA(api=None))
 ss.setdefault("lon", -35.3056)
@@ -143,6 +144,66 @@ def _cod_saida() -> str:
 def _nome_saida(base: str, ext: str) -> str:
     """Ex.: _nome_saida('chuva_media', 'csv') → '39480000_chuva_media.csv'."""
     return f"{_cod_saida()}_{base}.{ext}"
+
+
+def _postos_dia_alerta(alertas) -> "pd.DataFrame":
+    """Para cada data alertada na média da bacia, lista o que CADA posto
+    registrou naquele dia — valor bruto, valor efetivamente usado (após o QC
+    por posto), peso IDW e a contribuição para a média.
+
+    É a evidência que fecha a auditoria: permite ver se o valor da média veio
+    de um posto isolado com peso alto ou de muitos postos simultaneamente
+    altos (o que distingue erro pontual de evento real ou de erro sistêmico
+    de digitação naquela data)."""
+    if alertas is None or not len(alertas):
+        return pd.DataFrame()
+    brutas = ss.get("series") or {}
+    usadas = ss.get("series_qc") or {}
+    pesos = {}
+    if ss.postos_sel is not None:
+        dfp = ss.postos_sel.postos
+        if "peso_idw" in dfp.columns:
+            pesos = {str(c): float(w) for c, w in zip(dfp["cod"], dfp["peso_idw"])}
+    linhas = []
+    for d in pd.to_datetime(alertas["data"]):
+        # peso disponível no dia = soma dos pesos dos postos com dado válido
+        disp = []
+        for cod, s in usadas.items():
+            try:
+                v = s.get(d)
+            except Exception:
+                v = None
+            if v is not None and pd.notna(v):
+                disp.append((str(cod), float(v)))
+        w_tot = sum(pesos.get(c, 1.0) for c, _ in disp) or 1.0
+        for cod, v_uso in disp:
+            w = pesos.get(cod, 1.0)
+            bruto = None
+            try:
+                bruto = brutas.get(cod, pd.Series(dtype=float)).get(d)
+            except Exception:
+                pass
+            linhas.append({
+                "data": d.date(), "cod_posto": cod,
+                "valor_bruto_mm": (None if bruto is None or pd.isna(bruto)
+                                   else round(float(bruto), 2)),
+                "valor_usado_mm": round(v_uso, 2),
+                "peso_idw": round(w, 5),
+                "peso_renormalizado": round(w / w_tot, 5),
+                "contribuicao_mm": round(v_uso * w / w_tot, 2),
+            })
+        # postos SEM dado no dia (explicam a renormalização dos pesos)
+        for cod in usadas:
+            if str(cod) not in [c for c, _ in disp]:
+                linhas.append({"data": d.date(), "cod_posto": str(cod),
+                               "valor_bruto_mm": None, "valor_usado_mm": None,
+                               "peso_idw": round(pesos.get(str(cod), 1.0), 5),
+                               "peso_renormalizado": 0.0, "contribuicao_mm": 0.0})
+    df = pd.DataFrame(linhas)
+    if len(df):
+        df = df.sort_values(["data", "contribuicao_mm"],
+                            ascending=[True, False]).reset_index(drop=True)
+    return df
 
 
 def _metadata_dict() -> dict:
@@ -632,6 +693,7 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
                        if n_alerta else "."))
                 with st.expander("Detalhe do controle de qualidade", expanded=False):
                     st.dataframe(rel_qc, use_container_width=True)
+            ss.series_qc = series_uso      # séries pós-QC (p/ evidência dos alertas)
             mat = pd.DataFrame(series_uso)
             weights = [peso_por_cod.get(_norm(c), 1.0) for c in codes]
             res = idw.basin_mean_rainfall(mat, weights=weights,
@@ -712,6 +774,10 @@ if ss.bacia is not None:
             if len(_al):
                 z.writestr(_dir + _nome_saida("alertas_chuva_media", "csv"),
                            _al.to_csv(index=False))
+                _ev = _postos_dia_alerta(_al)
+                if len(_ev):
+                    z.writestr(_dir + _nome_saida("postos_dia_alerta", "csv"),
+                               _ev.to_csv(index=False))
         if ss.get("rel_qc") is not None and len(ss.rel_qc):
             z.writestr(_dir + _nome_saida("qc_chuva_postos", "csv"),
                        ss.rel_qc.to_csv(index=False))
