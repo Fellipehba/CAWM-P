@@ -89,6 +89,8 @@ ss.setdefault("series", {})
 ss.setdefault("chuva_media", None)
 ss.setdefault("rel_qc", None)
 ss.setdefault("series_qc", None)
+ss.setdefault("dominancia", None)
+ss.setdefault("flags_dom", None)
 ss.setdefault("etp_mensal", None)
 ss.setdefault("aq", ana.AquisicaoANA(api=None))
 ss.setdefault("lon", -35.3056)
@@ -648,6 +650,19 @@ modo_qc = st.radio(
          "A opção 'somente o dia' altera menos o registro bruto, mas mantém "
          "os zeros falsos. Extremos físicos e valores repetidos são apenas "
          "sinalizados, nunca removidos.")
+_c1, _c2 = st.columns([2, 3])
+with _c1:
+    dom_max = st.slider("Dominância máxima de um posto", 0.3, 1.0, 0.5, 0.05,
+                        help="Fração do peso que um único posto pode ter no dia. "
+                             "A cobertura do IDW mede peso disponível, não "
+                             "concentração: em Barreiros, 1960-01-29 tinha "
+                             "cobertura 0,42 (alta) com 85% num posto só — a "
+                             "média daquele dia era a medida de UM pluviômetro.")
+with _c2:
+    aplicar_dom = st.checkbox("Invalidar dias acima da dominância máxima",
+                              value=False,
+                              help="Desmarcado (padrão): apenas sinaliza. "
+                                   "Marcado: zera esses dias na chuva média.")
 if st.button("Calcular chuva média (IDW)", type="primary"):
     if ss.postos_sel is None or not ss.series:
         st.error("Selecione postos (Passo 2) e carregue séries (Passo 3).")
@@ -698,11 +713,20 @@ if st.button("Calcular chuva média (IDW)", type="primary"):
             weights = [peso_por_cod.get(_norm(c), 1.0) for c in codes]
             res = idw.basin_mean_rainfall(mat, weights=weights,
                                           min_coverage=min_cov)
+            # Dominância: fração do peso do MAIOR posto no dia. A `cobertura`
+            # do IDW mede peso disponível, não concentração — em Barreiros,
+            # 1960-01-29 tinha cobertura 0,42 (alta) mas 85% num posto só.
+            ss.dominancia = cq.dominancia_diaria(mat, weights)
+            ss.flags_dom = cq.flag_dominancia(mat, weights, limiar=dom_max)
+            if aplicar_dom and len(ss.flags_dom):
+                mask = ss.dominancia.reindex(res.rainfall.index) > dom_max
+                res.rainfall[mask.fillna(False)] = np.nan
             barra.empty()
             ss.chuva_media = res
             st.success(f"{res.rainfall.notna().sum()} dias válidos · "
                        f"{len(codes)} postos no IDW · "
-                       f"cobertura mediana {res.coverage.median():.2f}")
+                       f"cobertura mediana {res.coverage.median():.2f} · "
+                       f"dominância mediana {ss.dominancia.median():.2f}")
 
 if ss.chuva_media is not None:
     res = ss.chuva_media
@@ -720,6 +744,18 @@ if ss.chuva_media is not None:
     else:
         st.caption("Auditoria da média da bacia: nenhum valor implausível "
                    "para a escala da bacia.")
+
+    if ss.get("flags_dom") is not None and len(ss.flags_dom):
+        n = len(ss.flags_dom)
+        st.warning(
+            f"⚠️ {n} dia(s) ({100*n/max(len(res.rainfall.dropna()),1):.1f}%) em que "
+            f"um único posto responde por mais de {dom_max:.0%} da média — nesses "
+            "dias não há redundância espacial e um erro de posto passa direto "
+            "para a média da bacia."
+            + (" **Foram invalidados** conforme sua opção." if aplicar_dom
+               else " Apenas sinalizados (marque a opção acima para invalidá-los)."))
+        with st.expander("Dias com dominância de um posto", expanded=False):
+            st.dataframe(ss.flags_dom, use_container_width=True, hide_index=True)
 
 
 # ==========================================================================
@@ -766,6 +802,8 @@ if ss.bacia is not None:
             # altos em séries antigas com poucos postos reportando).
             try:
                 out["cobertura"] = _cm.coverage.reindex(out.index).round(3)
+                if ss.get("dominancia") is not None:
+                    out["dominancia"] = ss.dominancia.reindex(out.index).round(3)
             except Exception:
                 pass
             out.index.name = "data"
@@ -778,6 +816,9 @@ if ss.bacia is not None:
                 if len(_ev):
                     z.writestr(_dir + _nome_saida("postos_dia_alerta", "csv"),
                                _ev.to_csv(index=False))
+        if ss.get("flags_dom") is not None and len(ss.flags_dom):
+            z.writestr(_dir + _nome_saida("alertas_dominancia", "csv"),
+                       ss.flags_dom.to_csv(index=False))
         if ss.get("rel_qc") is not None and len(ss.rel_qc):
             z.writestr(_dir + _nome_saida("qc_chuva_postos", "csv"),
                        ss.rel_qc.to_csv(index=False))

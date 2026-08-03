@@ -230,6 +230,57 @@ def limpar_serie(s: pd.Series, flags: pd.DataFrame,
     return limpa
 
 
+def dominancia_diaria(mat: "pd.DataFrame", pesos=None) -> "pd.Series":
+    """Fração do peso renormalizado do MAIOR posto em cada dia.
+
+    Complementa a `cobertura` do IDW, que mede quanto PESO está disponível mas
+    não se ele está CONCENTRADO. Caso real (Barreiros, 39590000):
+
+        1960-01-29 → cobertura 0,419 · dominância 0,854 → média = 1 posto (erro)
+        2000-06-26 → cobertura 0,300 · dominância 0,245 → 5 postos (cheia real)
+
+    Ou seja: o dia ruim tinha cobertura MAIOR que o dia bom. A cobertura
+    sozinha não discrimina; a dominância sim.
+
+    `mat`: DataFrame (linhas = datas, colunas = postos) com as séries usadas.
+    `pesos`: lista/array de pesos na ordem das colunas (default = pesos iguais).
+    Retorna Série indexada por data, valores em [0, 1]; NaN em dias sem dado.
+    """
+    if pesos is None:
+        w = np.ones(mat.shape[1], dtype="float64")
+    else:
+        w = np.asarray(pesos, dtype="float64")
+        if w.size != mat.shape[1]:
+            w = np.ones(mat.shape[1], dtype="float64")
+    valido = mat.notna().to_numpy()
+    wm = valido * w                      # peso de cada posto onde há dado
+    soma = wm.sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dom = np.where(soma > 0, wm.max(axis=1) / soma, np.nan)
+    return pd.Series(dom, index=mat.index, name="dominancia")
+
+
+def flag_dominancia(mat: "pd.DataFrame", pesos=None,
+                    limiar: float = 0.5) -> pd.DataFrame:
+    """Dias em que UM único posto responde por mais de `limiar` da média
+    ponderada. Nesses dias a 'média da bacia' é, na prática, a medida de um
+    posto — sem redundância espacial para detectar erro. Só ALERTA.
+
+    Retorna DataFrame [data, valor(dominância), teste, motivo]."""
+    dom = dominancia_diaria(mat, pesos)
+    n_val = mat.notna().sum(axis=1)
+    sel = dom[(dom > limiar) & n_val.gt(0)]
+    if not len(sel):
+        return pd.DataFrame(columns=["data", "valor", "teste", "motivo"])
+    return pd.DataFrame({
+        "data": sel.index, "valor": sel.values.round(4),
+        "teste": "dominancia_de_posto",
+        "motivo": [f"um único posto responde por {100*v:.0f}% da média "
+                   f"({int(n)} posto(s) com dado no dia)"
+                   for v, n in zip(sel.values, n_val.reindex(sel.index).values)],
+    }).reset_index(drop=True)
+
+
 def auditar_media_bacia(p: pd.Series, k_mad: float = 5.0,
                         frac_isolado: float = 0.6,
                         janela: int = 11) -> pd.DataFrame:
