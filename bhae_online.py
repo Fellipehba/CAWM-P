@@ -101,7 +101,7 @@ class BaciaPronta:
         self.area_poly_km2 = float(area_km2)      # mesma (geometria simplificada)
         self.area_topo_km2 = float(area_km2)      # área topológica = oficial aqui
         self.cotrecho_exutorio = 0                # metadado de proveniência (n/d na pronta)
-        self.rio = rio or "—"
+        self.rio = rio if rio and str(rio).strip() not in {"<NA>", "nan", "None"} else "—"
         self.n_trechos = 0
         self.snap_dist_m = 0.0
         self.cod_posto = str(cod_posto)

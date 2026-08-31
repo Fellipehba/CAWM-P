@@ -190,3 +190,23 @@ def conservation_identity(report: pd.DataFrame) -> bool:
     """Every request must belong to exactly one terminal status."""
     counts = summarize_report(report)
     return sum(counts.values()) == len(report) and report["request_index"].is_unique
+
+
+def user_uploaded_report(station_id: str, series: pd.Series,
+                         request_index: int = 1) -> pd.DataFrame:
+    """Create one auditable report row for a successfully parsed manual file."""
+    values = series.copy()
+    values.index = pd.to_datetime(values.index)
+    row = {
+        "request_index": request_index, "station_id": normalize_station_code(station_id),
+        "selected_spatially": True, "attempted": True,
+        "status": AcquisitionStatus.USER_UPLOADED.value,
+        "provider_method": "manual_upload",
+        "start_date": str(values.index.min().date()) if len(values) else "",
+        "end_date": str(values.index.max().date()) if len(values) else "",
+        "n_records": int(len(values)), "n_valid": int(values.notna().sum()),
+        "error_type": "", "error_message": "", "retries": 0,
+        "elapsed_seconds": 0.0, "timeout_seconds": 0.0,
+        "duplicate_of_request_index": "",
+    }
+    return pd.DataFrame([row], columns=REPORT_COLUMNS)

@@ -43,7 +43,9 @@ HISTORICAL_SERIES_URL = (
 )
 
 
-def _parse_precipitation_xml(content: bytes, only_consisted: bool = False) -> pd.Series:
+def _parse_historical_xml(content: bytes, *, field_prefix: str,
+                          series_name: str,
+                          only_consisted: bool = False) -> pd.Series:
     """Parse one ANA historical-series XML response without hiding failures."""
     try:
         root = ET.fromstring(content)
@@ -61,7 +63,7 @@ def _parse_precipitation_xml(content: bytes, only_consisted: bool = False) -> pd
         start = pd.to_datetime(date_node.text)
         n_days = calendar.monthrange(start.year, start.month)[1]
         for day in range(1, n_days + 1):
-            node = month.find(f"Chuva{day:02d}")
+            node = month.find(f"{field_prefix}{day:02d}")
             if node is None or node.text in (None, ""):
                 continue
             try:
@@ -73,12 +75,24 @@ def _parse_precipitation_xml(content: bytes, only_consisted: bool = False) -> pd
             if previous is None or consistency >= previous[0]:
                 observations[date] = (consistency, value)
     if not observations:
-        raise NoDataError("ANA returned a valid response with no precipitation observations")
+        raise NoDataError(f"ANA returned a valid response with no {series_name} observations")
     start, end = min(observations), max(observations)
     values = {date: item[1] for date, item in observations.items()}
-    return pd.Series(values, name="precipitation_mm_day").sort_index().reindex(
+    return pd.Series(values, name=series_name).sort_index().reindex(
         pd.date_range(start, end, freq="D")
     )
+
+
+def _parse_precipitation_xml(content: bytes, only_consisted: bool = False) -> pd.Series:
+    return _parse_historical_xml(content, field_prefix="Chuva",
+                                 series_name="precipitation_mm_day",
+                                 only_consisted=only_consisted)
+
+
+def _parse_streamflow_xml(content: bytes, only_consisted: bool = False) -> pd.Series:
+    return _parse_historical_xml(content, field_prefix="Vazao",
+                                 series_name="streamflow_m3_s",
+                                 only_consisted=only_consisted)
 
 
 def fetch_station_precipitation(codigo: str, *, timeout_seconds: float = 30.0,
@@ -106,6 +120,29 @@ def fetch_station_precipitation(codigo: str, *, timeout_seconds: float = 30.0,
         except NoDataError as exc:
             last_no_data = exc
     raise last_no_data or NoDataError("ANA returned no precipitation observations")
+
+
+def fetch_station_streamflow(codigo: str, *, timeout_seconds: float = 30.0,
+                             only_consisted: bool = False,
+                             session=None) -> pd.Series:
+    """Acquire one outlet-flow series with the same bounded request contract."""
+    client = session or requests
+    last_no_data = None
+    for variant in _variantes_codigo(codigo):
+        response = client.get(
+            HISTORICAL_SERIES_URL,
+            params={"codEstacao": variant, "dataInicio": "", "dataFim": "",
+                    "tipoDados": "3", "nivelConsistencia": ""},
+            timeout=float(timeout_seconds),
+        )
+        response.raise_for_status()
+        try:
+            series = _parse_streamflow_xml(response.content, only_consisted)
+            series.name = str(codigo)
+            return series
+        except NoDataError as exc:
+            last_no_data = exc
+    raise last_no_data or NoDataError("ANA returned no streamflow observations")
 
 
 def listar_estacoes(estado: str = "", tipo: str = "prec") -> pd.DataFrame:
@@ -153,11 +190,10 @@ def _variantes_codigo(cod: str):
 
 def baixar_vazao(codigo: str, only_consisted: bool = False) -> pd.Series:
     """Série diária de vazão [m³/s] da estação-exutório."""
-    for v in _variantes_codigo(codigo):
-        df, _ = _baixar([v], "flow", only_consisted)
-        if not df.empty:
-            return df.iloc[:, 0]
-    return pd.Series(dtype=float, name=str(codigo))
+    try:
+        return fetch_station_streamflow(codigo, only_consisted=only_consisted)
+    except NoDataError:
+        return pd.Series(dtype=float, name=str(codigo))
 
 
 def baixar_serie_chuva(codigo: str, only_consisted: bool = False):

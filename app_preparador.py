@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -61,8 +62,10 @@ import chuva_media_idw as idw
 import aquisicao_ana as ana
 import inventario as invmod
 import etp_base
-from station_acquisition import (AcquisitionPolicy, acquire_stations,
-                                 summarize_report)
+from station_acquisition import (AcquisitionPolicy, summarize_report,
+                                 user_uploaded_report)
+from combined_acquisition import acquire_rainfall_and_streamflow
+import rainfall_qc as rqc
 
 st.set_page_config(page_title="CAWM-P", layout="wide",
                    page_icon="🗺️")
@@ -95,6 +98,7 @@ ss.setdefault("postos_sel", None)
 ss.setdefault("trechos", None)
 ss.setdefault("areas", None)
 ss.setdefault("series", {})
+ss.setdefault("vazao", None)
 ss.setdefault("chuva_media", None)
 ss.setdefault("etp_mensal", None)
 ss.setdefault("aq", ana.AquisicaoANA(api=None))
@@ -103,6 +107,11 @@ ss.setdefault("lat", -8.6375)
 ss.setdefault("exutorio_estacao", None)
 ss.setdefault("map_click_pending", None)
 ss.setdefault("station_acquisition_report", None)
+ss.setdefault("outlet_acquisition_report", None)
+ss.setdefault("qc_flags", None)
+ss.setdefault("qc_decisions", None)
+ss.setdefault("qc_summary", None)
+ss.setdefault("series_qc", None)
 
 st.title(tr("prep.title"))
 st.caption(tr("prep.caption"))
@@ -163,6 +172,8 @@ def _metadata_dict() -> dict:
         "cotrecho_exutorio": int(b.cotrecho_exutorio),
         "n_trechos": int(b.n_trechos),
         "rio": str(b.rio),
+        "rio_fonte": ("BHAE geoft_bhae_trecho_drenagem.noriocomp; "
+                       "join exutorio->cotrecho" if b.rio != "—" else None),
         "snap_dist_m": float(b.snap_dist_m),
         "exutorio_lon": float(ss.lon),
         "exutorio_lat": float(ss.lat),
@@ -405,11 +416,15 @@ if idx_bhae is not None:
     termo_b = st.text_input(tr("prep.search"), key="busca_bhae")
     res_b = bo.buscar(idx_bhae, termo_b).head(30) if termo_b else idx_bhae.head(0)
     if len(res_b):
-        labels_b = [f"{'⚠️ ' if not r.geometria_confiavel else ''}{r.cod_posto} · "
-                    f"{r.nome_posto} · {r.area_usada_km2:,.0f} km²"
-                    f"{'' if r.geometria_confiavel else ' · ' + str(r.status)}"
-                    .replace(",", ".")
-                    for r in res_b.itertuples()]
+        labels_b = []
+        for r in res_b.itertuples():
+            river = getattr(r, "rio_bhae", None)
+            river_text = (str(river) if pd.notna(river) and str(river).strip()
+                          else tr.choose("River unavailable", "Rio não disponível"))
+            label = (f"{'⚠️ ' if not r.geometria_confiavel else ''}{r.cod_posto} · "
+                     f"{r.nome_posto} · {river_text} · {r.area_usada_km2:,.0f} km²"
+                     f"{'' if r.geometria_confiavel else ' · ' + str(r.status)}")
+            labels_b.append(label.replace(",", "."))
         escolha_b = st.selectbox(tr("prep.result"), labels_b, key="sel_bhae",
                                  help=tr.choose(
                                      "⚠️ = incomplete BHAE geometry. It can be loaded, but may not represent the real basin.",
@@ -455,7 +470,12 @@ with col1:
         b = ss.bacia
         st.metric(tr.choose("Upstream area (official ANA)", "Área a montante (oficial ANA)"),
                   f"{b.area_km2:,.0f} km²".replace(",", "."))
-        st.caption(tr.choose(f"River: {b.rio}", f"Rio: {b.rio}"))
+        if b.rio == "—":
+            st.caption(tr.choose("River: unavailable (no official BHAE match)",
+                                 "Rio: indisponível (sem correspondência oficial BHAE)"))
+        else:
+            st.caption(tr.choose(f"River: {b.rio} · source: BHAE noriocomp",
+                                 f"Rio: {b.rio} · fonte: BHAE noriocomp"))
         _msg = b.mensagem_status() if hasattr(b, "mensagem_status") else (
             None if getattr(b, "geometria_confiavel", True) else "Geometria incompleta.")
         if _msg:
@@ -528,172 +548,212 @@ if ss.postos_sel is not None:
 
 
 # ==========================================================================
-# Passo 3 — Séries de chuva dos postos
+# Passo 3 — Aquisição conjunta, auditável e com retries seletivos
 # ==========================================================================
 st.subheader(tr("prep.step3"))
-
-# --- Opção A: download automático da ANA (HydroBR refatorado, sem token) ----
-if ss.postos_sel is not None:
-    cods_plu = [str(c) for c in ss.postos_sel.postos["cod"]]
-    if st.button(tr("prep.download_rain", count=len(cods_plu)),
-                 type="primary"):
-        try:
-            import ana_hydrobr as ah
-        except Exception as e:
-            st.error(tr.choose(f"Provider unavailable ({e}). Use manual upload below.",
-                               f"Provedor indisponível ({e}). Use o upload manual abaixo."))
-        else:
-            prog = st.progress(0.0)
-            area = st.empty()
-            total = len(cods_plu)
-            batch = None
-            try:
-                def _progress(i, n, code):
-                    try:
-                        prog.progress(i / n)
-                        area.write(tr("prep.acquiring", code=code, index=i, total=n))
-                    except Exception:
-                        pass
-                batch = acquire_stations(
-                    cods_plu,
-                    lambda code, timeout_seconds: ah.fetch_station_precipitation(
-                        code, timeout_seconds=timeout_seconds, only_consisted=False),
-                    policy=AcquisitionPolicy(max_attempts=3, timeout_seconds=30.0,
-                                             backoff_seconds=0.5),
-                    progress=_progress,
-                )
-                ss.series.update(batch.series)
-                ss.station_acquisition_report = batch.report
-                counts = summarize_report(batch.report)
-            except Exception as e:
-                st.exception(e)        # traceback completo se algo escapar do loop
-            prog.empty(); area.empty()
-            if batch is not None:
-                message = tr("prep.acq_summary", done=len(batch.report), total=total,
-                             ok=counts["success"], no_data=counts["no_data"],
-                             failed=counts["failed_after_retries"],
-                             not_attempted=counts["not_attempted"])
-                if batch.completed_with_warnings:
-                    st.warning(f"{tr('prep.completed_warn')}: {message}")
-                else:
-                    st.success(f"{tr('prep.completed')}: {message}")
-    if ss.get("station_acquisition_report") is not None:
-        _acq_report = ss.station_acquisition_report
-        st.caption(tr("prep.report_caption"))
-        st.dataframe(_acq_report, use_container_width=True, height=240)
-        st.download_button(
-            tr("prep.report_download"),
-            _acq_report.to_csv(index=False, lineterminator="\n").encode("utf-8"),
-            file_name="station_acquisition_report.csv", mime="text/csv",
-        )
-else:
-    st.info(tr("prep.no_selection"))
-
-# --- Vazão do exutório (mesma estação FLU do Passo 1, sem redigitar) -------
-st.markdown(tr("prep.outlet_flow"))
 cod_flu = (ss.exutorio_estacao or {}).get("cod", "").strip() if ss.get("exutorio_estacao") else ""
-if cod_flu:
-    st.caption(tr.choose(
-        f"Outlet station (Step 1): {cod_flu} · {(ss.exutorio_estacao or {}).get('nome', '')}",
-        f"Estação do exutório (Passo 1): {cod_flu} · {(ss.exutorio_estacao or {}).get('nome', '')}"))
-else:
-    st.info(tr.choose("Choose an FLU outlet station in Step 1 to acquire streamflow automatically.",
-                      "Escolha o exutório por posto FLU no Passo 1 para baixar a vazão automaticamente."))
-if st.button(tr.choose("⬇ Acquire outlet streamflow (ANA)", "⬇ Baixar vazão do exutório (ANA)"), disabled=not cod_flu):
-    if not cod_flu:
-        st.error(tr.choose("Define the outlet station in Step 1.", "Defina o exutório por estação no Passo 1."))
-    else:
+cods_plu = ([str(c) for c in ss.postos_sel.postos["cod"]]
+            if ss.postos_sel is not None else [])
+ready = bool(cods_plu and cod_flu)
+st.caption(tr.choose(
+    "One primary action acquires rainfall for every selected PLU station and streamflow for the Step 1 FLU outlet. Each request is reported.",
+    "Uma ação principal baixa chuva de todos os postos PLU selecionados e vazão do exutório FLU do Passo 1. Cada requisição é registrada."))
+
+def _run_combined(retry_failed_only=False, retry_scope="all"):
+    import ana_hydrobr as ah
+    prog = st.progress(0.0)
+    area = st.empty()
+    def _progress(i, n, code):
+        prog.progress(i / max(1, n))
+        area.write(tr("prep.acquiring", code=code, index=i, total=n))
+    result = acquire_rainfall_and_streamflow(
+        cods_plu, cod_flu,
+        lambda code, timeout_seconds: ah.fetch_station_precipitation(
+            code, timeout_seconds=timeout_seconds, only_consisted=False),
+        lambda code, timeout_seconds: ah.fetch_station_streamflow(
+            code, timeout_seconds=timeout_seconds, only_consisted=False),
+        policy=AcquisitionPolicy(max_attempts=3, timeout_seconds=30.0,
+                                 backoff_seconds=1.0, jitter_seconds=0.25,
+                                 max_workers=4),
+        previous_rainfall=ss.series,
+        previous_streamflow=ss.get("vazao"),
+        previous_rainfall_report=ss.get("station_acquisition_report"),
+        previous_outlet_report=ss.get("outlet_acquisition_report"),
+        retry_failed_only=retry_failed_only, retry_scope=retry_scope,
+        progress=_progress,
+    )
+    prog.empty(); area.empty()
+    ss.series = dict(result.rainfall)
+    ss.vazao = result.streamflow
+    ss.station_acquisition_report = result.rainfall_report
+    ss.outlet_acquisition_report = result.outlet_report
+    ss.qc_flags = ss.qc_decisions = ss.qc_summary = ss.series_qc = None
+    ss.chuva_media = None
+
+st.caption(tr.choose(f"Current selection: {len(cods_plu)} PLU station(s) · outlet {cod_flu or 'not selected'}.",
+                     f"Seleção atual: {len(cods_plu)} posto(s) PLU · exutório {cod_flu or 'não selecionado'}."))
+if st.button(tr.choose(
+        "⬇ Acquire rainfall and outlet streamflow (ANA)",
+        "⬇ Baixar chuva e vazão do exutório (ANA)"),
+        type="primary", disabled=not ready, use_container_width=True):
+    try:
+        _run_combined(False)
+        st.success(tr.choose("Combined acquisition completed; review both reports below.",
+                             "Aquisição conjunta concluída; revise os dois relatórios abaixo."))
+    except Exception as e:
+        st.exception(e)
+if not ready:
+    st.info(tr.choose("Load a FLU basin in Step 1 and select PLU stations in Step 2.",
+                      "Carregue uma bacia FLU no Passo 1 e selecione postos PLU no Passo 2."))
+
+failed_rain = (int(ss.station_acquisition_report["status"].eq("failed_after_retries").sum())
+               if isinstance(ss.get("station_acquisition_report"), pd.DataFrame) else 0)
+failed_flow = (int(ss.outlet_acquisition_report["status"].eq("failed_after_retries").sum())
+               if isinstance(ss.get("outlet_acquisition_report"), pd.DataFrame) else 0)
+retry_col1, retry_col2 = st.columns(2)
+with retry_col1:
+    if st.button(tr.choose(f"Retry failed rainfall stations ({failed_rain})",
+                           f"Repetir postos de chuva com falha ({failed_rain})"),
+                 disabled=(failed_rain == 0)):
         try:
-            import ana_hydrobr as ah
-            with st.spinner(tr.choose(f"Acquiring streamflow for station {cod_flu}…",
-                                      f"Baixando vazão da estação {cod_flu}…")):
-                sv = ah.baixar_vazao(cod_flu.strip(), only_consisted=False)
-            if sv.notna().any():
-                ss.vazao = sv
-                st.success(tr.choose(
-                    f"Streamflow acquired: {int(sv.notna().sum())} valid days, {sv.index.min().date()}–{sv.index.max().date()}, mean {float(sv.mean()):.1f} m³/s.",
-                    f"Vazão baixada: {int(sv.notna().sum())} dias válidos, {sv.index.min().date()}–{sv.index.max().date()}, média {float(sv.mean()):.1f} m³/s."))
-            else:
-                st.warning(tr.choose("ANA returned no streamflow. Try another code or manual upload.",
-                                     "A estação não retornou vazão na ANA. Tente outro código ou upload manual."))
+            _run_combined(True, "rainfall")
+            st.success(tr.choose("Rainfall retry completed; valid series were not downloaded again.",
+                                 "Retry de chuva concluído; séries válidas não foram baixadas novamente."))
         except Exception as e:
-            st.error(tr.choose(f"Streamflow acquisition failed: {e}", f"Falha ao baixar vazão: {e}"))
-if ss.get("vazao") is not None:
-    st.caption(tr.choose(f"Outlet streamflow loaded ({int(ss.vazao.notna().sum())} days).",
-                         f"Vazão do exutório carregada ({int(ss.vazao.notna().sum())} dias)."))
+            st.exception(e)
+with retry_col2:
+    if st.button(tr.choose(f"Retry outlet streamflow ({failed_flow})",
+                           f"Repetir vazão do exutório ({failed_flow})"),
+                 disabled=(failed_flow == 0)):
+        try:
+            _run_combined(True, "outlet")
+            st.success(tr.choose("Outlet retry completed; valid rainfall was not downloaded again.",
+                                 "Retry do exutório concluído; chuva válida não foi baixada novamente."))
+        except Exception as e:
+            st.exception(e)
+
+if isinstance(ss.get("station_acquisition_report"), pd.DataFrame):
+    rain_counts = summarize_report(ss.station_acquisition_report)
+    outlet_report_for_summary = (ss.outlet_acquisition_report
+                                 if isinstance(ss.get("outlet_acquisition_report"), pd.DataFrame)
+                                 else pd.DataFrame(columns=["status"]))
+    outlet_counts = summarize_report(outlet_report_for_summary)
+    rain_success = rain_counts["success"] + rain_counts["user_uploaded"]
+    outlet_success = outlet_counts["success"] + outlet_counts["user_uploaded"]
+    overall_warning = rain_counts["no_data"] + rain_counts["failed_after_retries"] + outlet_counts["no_data"] + outlet_counts["failed_after_retries"]
+    st.markdown(tr.choose(
+        f"**Rainfall stations:** Selected {len(ss.station_acquisition_report)} · Success {rain_success} · No data {rain_counts['no_data']} · Failed {rain_counts['failed_after_retries']}  \n"
+        f"**Outlet streamflow:** Success {outlet_success} · No data {outlet_counts['no_data']} · Failed {outlet_counts['failed_after_retries']}  \n"
+        f"**Overall:** {'Completed with warnings' if overall_warning else 'Completed'}",
+        f"**Postos de chuva:** Selecionados {len(ss.station_acquisition_report)} · Sucesso {rain_success} · Sem dados {rain_counts['no_data']} · Falha {rain_counts['failed_after_retries']}  \n"
+        f"**Vazão do exutório:** Sucesso {outlet_success} · Sem dados {outlet_counts['no_data']} · Falha {outlet_counts['failed_after_retries']}  \n"
+        f"**Estado geral:** {'Concluído com avisos' if overall_warning else 'Concluído'}"))
+
+for report_key, title, filename in [
+    ("station_acquisition_report", tr.choose("Rain-gauge acquisition report", "Relatório de aquisição PLU"), "station_acquisition_report.csv"),
+    ("outlet_acquisition_report", tr.choose("Outlet acquisition report", "Relatório de aquisição do exutório"), "outlet_streamflow_acquisition_report.csv"),
+]:
+    report = ss.get(report_key)
+    if isinstance(report, pd.DataFrame):
+        st.markdown(f"**{title}**")
+        st.caption(tr("prep.report_caption"))
+        st.dataframe(report, use_container_width=True, height=220)
+        st.download_button(tr.choose(f"Download {filename}", f"Baixar {filename}"),
+                           report.to_csv(index=False, lineterminator="\n").encode("utf-8"),
+                           file_name=filename, mime="text/csv", key=f"download_{report_key}")
+
+with st.expander(tr.choose("Manual upload fallback", "Fallback por upload manual"), expanded=False):
+    st.caption(tr.choose(
+        "Use classic HidroWeb monthly CSV files. Rainfall filenames must contain the station code; raw uploaded series are preserved.",
+        "Use CSVs mensais clássicos do HidroWeb. O nome de cada arquivo de chuva deve conter o código do posto; as séries brutas enviadas são preservadas."))
+    rain_uploads = st.file_uploader(tr.choose("Rainfall station files", "Arquivos dos postos de chuva"),
+                                    type=["csv", "txt"], accept_multiple_files=True,
+                                    key="manual_rain_files")
+    if st.button(tr.choose("Load manual rainfall files", "Carregar arquivos manuais de chuva"),
+                 disabled=not bool(rain_uploads)):
+        rows = []
+        for upload in rain_uploads:
+            matches = re.findall(r"(?<!\d)(\d{6,8})(?!\d)", upload.name)
+            if not matches:
+                st.error(tr.choose(f"Station code missing from filename: {upload.name}",
+                                   f"Código do posto ausente no nome: {upload.name}"))
+                continue
+            code = matches[0].lstrip("0") or "0"
+            series = ana.parse_serie_hidroweb(upload, ana.TIPO_CHUVA)
+            ss.series[code] = series
+            rows.append(user_uploaded_report(code, series, len(rows) + 1))
+        if rows:
+            manual = pd.concat(rows, ignore_index=True)
+            prior = ss.get("station_acquisition_report")
+            if isinstance(prior, pd.DataFrame):
+                prior = prior[~prior.station_id.astype(str).isin(manual.station_id.astype(str))]
+                manual = pd.concat([prior, manual], ignore_index=True)
+            ss.station_acquisition_report = manual
+            ss.qc_flags = ss.qc_decisions = ss.qc_summary = ss.series_qc = None
+            ss.chuva_media = None
+    flow_upload = st.file_uploader(tr.choose("Outlet streamflow file", "Arquivo de vazão do exutório"),
+                                   type=["csv", "txt"], key="manual_flow_file")
+    if st.button(tr.choose("Load manual outlet streamflow", "Carregar vazão manual do exutório"),
+                 disabled=(flow_upload is None or not cod_flu)):
+        series = ana.parse_serie_hidroweb(flow_upload, ana.TIPO_VAZAO)
+        ss.vazao = series
+        ss.outlet_acquisition_report = user_uploaded_report(cod_flu, series)
 
 
 # ==========================================================================
-# Passo 4 — Chuva média
+# Passo 4 — QC em duas etapas e chuva média
 # ==========================================================================
 st.subheader(tr("prep.step4"))
-modo_qc = st.radio(
-    tr.choose("Quality control — monthly total recorded as a daily value",
-              "Controle de qualidade — total mensal lançado como dado diário"),
-    ["month", "day"],
-    format_func=lambda x: ({"month": tr.choose("Station month (recommended)", "Mês do posto (recomendado)"),
-                            "day": tr.choose("Recorded day only", "Somente o dia do lançamento")}[x]),
-    horizontal=True,
-    help=tr.choose(
-        "If a monthly total is recorded on one day, the other zeroes are not measurements. Month mode invalidates that station-month; IDW uses other stations. Physical extremes and repeats are flagged, not removed.",
-        "Se o total mensal é lançado num dia, os demais zeros não são medições. O modo mensal invalida posto-mês; o IDW usa outros postos. Extremos e repetições são sinalizados, não removidos."))
-if st.button(tr("prep.mean_button"), type="primary"):
-    if ss.postos_sel is None or not ss.series:
-        st.error(tr.choose("Select stations (Step 2) and load series (Step 3).",
-                           "Selecione postos (Passo 2) e carregue séries (Passo 3)."))
-    else:
-        def _norm(c):
-            c = str(c).strip()
-            return c[:-2] if c.endswith(".0") else c
-        postos = ss.postos_sel.postos.copy()
-        postos["_cod"] = postos["cod"].map(_norm)
-        peso_por_cod = postos.set_index("_cod")["peso_idw"].to_dict()
-        # casa as séries baixadas (chaves já normalizadas) com os postos PLU
-        codes = [k for k in ss.series.keys() if _norm(k) in peso_por_cod]
-        if not codes:                       # fallback: usa o que baixou
-            codes = list(ss.series.keys())
-        if not codes:
-            st.error(tr.choose("No series loaded. Acquire in Step 3 or upload manually.",
-                               "Nenhuma série carregada. Baixe no Passo 3 ou envie manualmente."))
-        else:
-            # --- Controle de qualidade por posto (antes do IDW) -----------
-            # Detecta e invalida: total mensal lançado como dado diário
-            # (assinatura: valor concentrado no último/primeiro dia do mês),
-            # valores fisicamente implausíveis e pluviômetro travado.
-            import consistencia_chuva as cq
-            series_uso = {c: ss.series[c] for c in codes}
-            barra = st.progress(0.0, text=tr.choose("Series quality control…", "Controle de qualidade das séries…"))
-            def _prog(i, n, cod):
-                barra.progress(i / n, text=tr.choose(
-                    f"Quality control: station {cod} ({i}/{n})",
-                    f"Controle de qualidade: posto {cod} ({i}/{n})"))
-            rel_qc, series_uso = cq.auditar_conjunto(
-                series_uso, progresso=_prog,
-                modo_total_mensal=("mes" if modo_qc == "month" else "dia"))
-            barra.progress(1.0, text=tr.choose("Calculating weighted mean (IDW)…",
-                                               "Calculando a média ponderada (IDW)…"))
-            if len(rel_qc):
-                n_postos_qc = rel_qc["cod"].nunique()
-                n_inval = int((rel_qc["acao"] != "apenas alerta").sum())
-                n_alerta = int((rel_qc["acao"] == "apenas alerta").sum())
-                st.warning(tr.choose(
-                    f"Quality control: {n_postos_qc} station(s), {n_inval} monthly-total record(s) invalidated, {n_alerta} alert-only occurrence(s).",
-                    f"Controle de qualidade: {n_postos_qc} posto(s), {n_inval} lançamento(s) mensal(is) invalidado(s), {n_alerta} ocorrência(s) apenas sinalizada(s)."))
-                with st.expander(tr.choose("Quality-control details", "Detalhe do controle de qualidade"), expanded=False):
-                    st.dataframe(rel_qc, use_container_width=True)
-                    st.download_button(tr.choose("Download QC report (CSV)", "Baixar relatório de QC (CSV)"),
-                                       rel_qc.to_csv(index=False).encode("utf-8"),
-                                       file_name=_nome_saida("qc_chuva", "csv"),
-                                       mime="text/csv")
-            mat = pd.DataFrame(series_uso)
-            weights = [peso_por_cod.get(_norm(c), 1.0) for c in codes]
-            res = idw.basin_mean_rainfall(mat, weights=weights,
-                                          min_coverage=min_cov)
-            barra.empty()
-            ss.chuva_media = res
-            st.success(tr.choose(
-                f"{res.rainfall.notna().sum()} valid days · {len(codes)} IDW stations · median coverage {res.coverage.median():.2f}",
-                f"{res.rainfall.notna().sum()} dias válidos · {len(codes)} postos no IDW · cobertura mediana {res.coverage.median():.2f}"))
+st.markdown(tr.choose("**4A · Detect and review flags**", "**4A · Detectar e revisar flags**"))
+preset = st.selectbox(tr.choose("Decision preset", "Preset de decisões"), list(rqc.PRESETS),
+                      format_func=lambda x: {"recommended": tr.choose("Recommended", "Recomendado"),
+                                              "exclude_all": tr.choose("Exclude all", "Excluir tudo"),
+                                              "keep_all": tr.choose("Keep all", "Manter tudo")}[x])
+if st.button(tr.choose("Detect rainfall QC flags", "Detectar flags de QC da chuva"), disabled=not bool(ss.series)):
+    flags = rqc.detect_flags(ss.series)
+    ss.qc_flags = flags
+    ss.qc_decisions = rqc.build_decisions(flags, preset)
+    ss.qc_summary = rqc.summarize_qc(flags, ss.qc_decisions)
+if isinstance(ss.get("qc_decisions"), pd.DataFrame):
+    if st.button(tr.choose("Apply preset to decision table", "Aplicar preset à tabela de decisões")):
+        ss.qc_decisions = rqc.build_decisions(ss.qc_flags, preset)
+    st.caption(tr.choose(
+        "Recommended policy: monthly-total flags exclude the entire station-month; physical-limit and repeated-value flags remain recorded. Edit any selected_action before application.",
+        "Política recomendada: flags de total mensal excluem todo o posto-mês; limite físico e valor repetido permanecem registrados. Edite selected_action antes da aplicação."))
+    st.info(tr.choose(
+        "Quality-control flags identify suspect observations; not every flag is an error.",
+        "As marcações de controle de qualidade identificam observações suspeitas; nem todo alerta é um erro."))
+    ss.qc_decisions = st.data_editor(
+        ss.qc_decisions, disabled=["station_id", "date", "value", "test", "reason", "recommended_action", "scope"],
+        column_config={"selected_action": st.column_config.SelectboxColumn(options=list(rqc.ACTIONS), required=True)},
+        use_container_width=True, hide_index=True, key="qc_decision_editor")
+    ss.qc_summary = rqc.summarize_qc(ss.qc_flags, ss.qc_decisions)
+    c1, c2, c3 = st.columns(3)
+    c1.download_button(tr.choose("Download QC flags", "Baixar flags de QC"), ss.qc_flags.to_csv(index=False).encode(), "rainfall_qc_flags.csv", "text/csv")
+    c2.download_button(tr.choose("Download QC decisions", "Baixar decisões de QC"), ss.qc_decisions.to_csv(index=False).encode(), "rainfall_qc_decisions.csv", "text/csv")
+    c3.download_button(tr.choose("Download QC summary", "Baixar resumo de QC"),
+                       ss.qc_summary.to_json(orient="records", indent=2).encode(),
+                       "rainfall_qc_summary.json", "application/json")
+
+st.markdown(tr.choose("**4B · Apply reviewed decisions and calculate IDW**", "**4B · Aplicar decisões revisadas e calcular IDW**"))
+if st.button(tr.choose("Apply QC decisions and calculate mean rainfall (IDW)",
+                       "Aplicar decisões de QC e calcular chuva média (IDW)"),
+             type="primary", disabled=not isinstance(ss.get("qc_decisions"), pd.DataFrame)):
+    def _norm(c):
+        c = str(c).strip()
+        return c[:-2] if c.endswith(".0") else c
+    postos = ss.postos_sel.postos.copy()
+    postos["_cod"] = postos["cod"].map(_norm)
+    peso_por_cod = postos.set_index("_cod")["peso_idw"].to_dict()
+    codes = [k for k in ss.series if _norm(k) in peso_por_cod]
+    ss.series_qc = rqc.apply_decisions({c: ss.series[c] for c in codes}, ss.qc_decisions)
+    mat = pd.DataFrame(ss.series_qc)
+    weights = [peso_por_cod.get(_norm(c), 1.0) for c in codes]
+    res = idw.basin_mean_rainfall(mat, weights=weights, min_coverage=min_cov)
+    ss.chuva_media = res
+    st.success(tr.choose(
+        f"{res.rainfall.notna().sum()} valid days · {len(codes)} IDW stations · raw series preserved.",
+        f"{res.rainfall.notna().sum()} dias válidos · {len(codes)} postos IDW · séries brutas preservadas."))
 
 if ss.chuva_media is not None:
     res = ss.chuva_media
@@ -759,6 +819,13 @@ if ss.bacia is not None:
         if ss.get("station_acquisition_report") is not None:
             z.writestr(_dir + "station_acquisition_report.csv",
                        ss.station_acquisition_report.to_csv(index=False, lineterminator="\n"))
+        if ss.get("outlet_acquisition_report") is not None:
+            z.writestr(_dir + "outlet_streamflow_acquisition_report.csv",
+                       ss.outlet_acquisition_report.to_csv(index=False, lineterminator="\n"))
+        if isinstance(ss.get("qc_flags"), pd.DataFrame):
+            z.writestr(_dir + "rainfall_qc_flags.csv", ss.qc_flags.to_csv(index=False, lineterminator="\n"))
+            z.writestr(_dir + "rainfall_qc_decisions.csv", ss.qc_decisions.to_csv(index=False, lineterminator="\n"))
+            z.writestr(_dir + "rainfall_qc_summary.json", ss.qc_summary.to_json(orient="records", indent=2))
     st.download_button(tr("prep.package"),
                        pacote.getvalue(),
                        file_name=_nome_saida("cawm_pacote_bacia", "zip"),

@@ -9,7 +9,9 @@ nuareamont_km2, area_geometrica_km2, area_oficial_km2, desvio_oficial,
 desvio_fechamento, geometry` — CRS EPSG:4674.
 
 Diferenças em relação ao schema antigo, tratadas aqui:
-  * `nome_posto`→`nome`; `area_usada_km2`→`area_oficial_km2`; sem `rio_bhae`.
+  * `nome_posto`→`nome`; `area_usada_km2`→`area_oficial_km2`.
+  * `rio_bhae` é obtido exclusivamente por `exutorio`→`cotrecho` no
+    GeoPackage oficial BHAE, campo `noriocomp`; nunca pelo nome do posto.
   * **Sem lon/lat no parquet** → obtidos por junção com o inventário
     (`inventario_ana_estacoes.csv`) via `cod_posto == cod`. OBRIGATÓRIO: o
     Preparador precisa da coordenada do posto para o exutório e o mapa.
@@ -55,6 +57,9 @@ def main():
     ap.add_argument("--compression", default="zstd",
                     help="codec do parquet: zstd (menor) ou snappy (rápido).")
     ap.add_argument("--saida", default="bhae_bacias.parquet")
+    ap.add_argument("--rios-gpkg", default=None,
+                    help="GeoPackage oficial geoft_bhae_trecho_drenagem; "
+                         "adiciona rio_bhae por exutorio->cotrecho/noriocomp.")
     args = ap.parse_args()
 
     import geopandas as gpd
@@ -114,6 +119,16 @@ def main():
         "area_usada_km2": pd.to_numeric(g[col_area], errors="coerce"),
         "status": g["status"].astype(str) if "status" in g.columns else "ok",
     }, geometry=g.geometry, crs=g.crs)
+
+    if args.rios_gpkg:
+        from river_provenance import read_official_river_map
+        rios = read_official_river_map(args.rios_gpkg, g["exutorio"])
+        chave = pd.to_numeric(g["exutorio"], errors="coerce").astype("Int64")
+        por_exutorio = rios.set_index("exutorio")["rio_bhae"]
+        out["rio_bhae"] = chave.map(por_exutorio).astype("string")
+        print(f"  rios oficiais BHAE: {out['rio_bhae'].notna().sum()} de {len(out)}")
+    else:
+        out["rio_bhae"] = pd.Series(pd.NA, index=out.index, dtype="string")
 
     # --- simplifica preservando topologia ---------------------------------
     print(f"simplificando a {args.tol}°…")
